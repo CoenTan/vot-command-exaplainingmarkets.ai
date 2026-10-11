@@ -53,8 +53,13 @@ def fake(monkeypatch):
     monkeypatch.delenv("ALWAYS_CALL_PM", raising=False)
     monkeypatch.setenv("USE_CONTEXT_AGENT", "0")   # iteration-1 tests; context tests switch it on
     monkeypatch.setenv("USE_SEC_FILINGS", "0")     # never touch the network in tests
-    for k in ("QUANT_POWER", "QUANT_REF_MOVE", "QUANT_PIVOT", "COMPONENT_WEIGHTS"):
-        monkeypatch.delenv(k, raising=False)
+    # Pipeline tests check the flow with the original, simple arithmetic
+    # (every weight 1, square-root sizing around 0.50 vs a 6% move). The
+    # trained defaults are tested on their own below.
+    monkeypatch.setenv("COMPONENT_WEIGHTS", ",".join(f"{k}=1" for k in P.COMPONENT_LIMITS))
+    monkeypatch.setenv("QUANT_POWER", "0.5")
+    monkeypatch.setenv("QUANT_REF_MOVE", "0.06")
+    monkeypatch.setenv("QUANT_PIVOT", "0.5")
 
     def install(*replies):
         client = FakeClient(replies)
@@ -77,7 +82,8 @@ def test_points_are_clamped_and_summed():
 @pytest.mark.parametrize("s, expected", [
     (0, 0.50), (3, 0.65), (-3, 0.35), (11, 0.95), (-11, 0.05),
 ])
-def test_score_from_points(s, expected):
+def test_score_from_points(s, expected, monkeypatch):
+    monkeypatch.delenv("COMPONENT_WEIGHTS", raising=False)
     pts = {k: 0 for k in P.COMPONENT_LIMITS}
     pts["guidance"] = s  # bypass clamp on purpose to test the conversion only
     assert P.score_from_points(pts)["score"] == expected
@@ -86,9 +92,28 @@ def test_score_from_points(s, expected):
 def test_component_weights_from_env(monkeypatch):
     monkeypatch.setenv("COMPONENT_WEIGHTS", "guidance=2, eps=0, bogus=9, tone=abc, revenue=99")
     w = P.component_weights()
-    assert w["guidance"] == 2 and w["eps"] == 0 and w["tone"] == 1 and w["revenue"] == 1
+    assert w["guidance"] == 2 and w["eps"] == 0
+    assert w["tone"] == P.DEFAULT_WEIGHTS["tone"] and w["revenue"] == P.DEFAULT_WEIGHTS["revenue"]
     pts = {k: 0 for k in P.COMPONENT_LIMITS} | {"guidance": 2, "eps": 1}
     assert P.score_from_points(pts) == {"total_s": 4.0, "score": 0.70}
+
+
+def test_trained_default_weights(monkeypatch):
+    monkeypatch.delenv("COMPONENT_WEIGHTS", raising=False)
+    assert P.component_weights() == P.DEFAULT_WEIGHTS
+    # an EPS beat alone earns nothing: the scorer already controls for the surprise
+    assert P.score_from_points({"eps": 1})["score"] == 0.50
+    # guidance +2, revenue +2, tone -1 -> 2 + 1.2 - 1 = 2.2 -> 0.61 -> 0.60
+    assert P.score_from_points({"guidance": 2, "revenue": 2, "tone": -1}) == {"total_s": 2.2, "score": 0.60}
+
+
+def test_trained_quant_defaults(monkeypatch):
+    for k in ("QUANT_POWER", "QUANT_REF_MOVE", "QUANT_PIVOT"):
+        monkeypatch.delenv(k, raising=False)
+    assert P.apply_quant(0.70, 0.08) == 0.70       # median move: unchanged
+    assert P.apply_quant(0.75, 0.32) == 0.85       # 4x move -> distance x1.41 around 0.55
+    assert P.apply_quant(0.55, 0.32) == 0.55       # the pivot never moves
+    assert P.apply_quant(0.70, None) == 0.70
 
 
 @pytest.mark.parametrize("score, move, expected", [
@@ -101,8 +126,9 @@ def test_component_weights_from_env(monkeypatch):
     (0.90, 0.24, 0.95),    # capped
 ])
 def test_quant_sizing(score, move, expected, monkeypatch):
-    for k in ("QUANT_POWER", "QUANT_REF_MOVE", "QUANT_PIVOT"):
-        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("QUANT_POWER", "0.5")
+    monkeypatch.setenv("QUANT_REF_MOVE", "0.06")
+    monkeypatch.setenv("QUANT_PIVOT", "0.5")
     assert P.apply_quant(score, move) == expected
 
 
@@ -136,11 +162,20 @@ def test_close_call_averages_without_calling_pm(fake):
 
 def test_disagreement_calls_pm_and_snaps_its_answer(fake):
     client = fake(sheet(guidance=3, revenue=2), scrut({"guidance": "FACT", "revenue": "FACT"}, guidance=-1),
-                  {"final_score": 0.58, "settled_components": {"guidance": 1}})
-    assert run() == 0.60          # 0.58 snapped to grid
+                  {"final_score": 0.58})
+    assert run() == 0.60          # no settled sheet: 0.58 snapped to grid
     assert len(client.sent) == 3
     pm_msg = client.sent[2]["messages"][1]["content"]
     assert "analyst_score=0.75" in pm_msg and "scrutinizer_score=0.45" in pm_msg
+
+
+def test_pm_settled_points_are_rescored_in_python(fake):
+    fake(sheet(guidance=3, revenue=2), scrut({"guidance": "FACT", "revenue": "FACT"}, guidance=-1),
+         {"final_score": 0.80, "settled_components": {"guidance": 2, "revenue": 1}})
+    trace = {}
+    final = P.run_agents(bundle=BUNDLE, ticker="NVDA", event_type="EARNINGS_RELEASE", trace=trace)
+    assert trace["pm_score"] == 0.65   # S = 3 -> 0.65, not the model's 0.80
+    assert final == 0.65               # sized: 0.5 + 0.15 * sqrt(5.1% / 6%) = 0.638 -> 0.65
 
 
 def test_models_maths_is_overwritten_before_the_next_agent_sees_it(fake):
