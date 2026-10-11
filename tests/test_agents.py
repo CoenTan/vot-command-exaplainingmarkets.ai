@@ -53,6 +53,8 @@ def fake(monkeypatch):
     monkeypatch.delenv("ALWAYS_CALL_PM", raising=False)
     monkeypatch.setenv("USE_CONTEXT_AGENT", "0")   # iteration-1 tests; context tests switch it on
     monkeypatch.setenv("USE_SEC_FILINGS", "0")     # never touch the network in tests
+    for k in ("QUANT_POWER", "QUANT_REF_MOVE", "QUANT_PIVOT", "COMPONENT_WEIGHTS"):
+        monkeypatch.delenv(k, raising=False)
 
     def install(*replies):
         client = FakeClient(replies)
@@ -72,20 +74,47 @@ def test_points_are_clamped_and_summed():
     assert pts["guidance"] == 3 and pts["eps"] == -1 and pts["tone"] == 1 and pts["revenue"] == 0
 
 
-@pytest.mark.parametrize("s, move, expected", [
-    (0, 0.12, 0.50),     # 0.50 never moves
-    (3, 0.05, 0.65),     # 4-8% move: no change
-    (3, 0.09, 0.70),     # >=8%: one step further
-    (-3, 0.09, 0.30),
-    (3, 0.02, 0.60),     # <4%: one step toward 0.50
-    (-1, 0.02, 0.50),
-    (11, 0.20, 0.95),    # capped
-    (-11, None, 0.05),
+@pytest.mark.parametrize("s, expected", [
+    (0, 0.50), (3, 0.65), (-3, 0.35), (11, 0.95), (-11, 0.05),
 ])
-def test_score_from_points(s, move, expected):
+def test_score_from_points(s, expected):
     pts = {k: 0 for k in P.COMPONENT_LIMITS}
     pts["guidance"] = s  # bypass clamp on purpose to test the conversion only
-    assert P.score_from_points(pts, move)["score"] == expected
+    assert P.score_from_points(pts)["score"] == expected
+
+
+def test_component_weights_from_env(monkeypatch):
+    monkeypatch.setenv("COMPONENT_WEIGHTS", "guidance=2, eps=0, bogus=9, tone=abc, revenue=99")
+    w = P.component_weights()
+    assert w["guidance"] == 2 and w["eps"] == 0 and w["tone"] == 1 and w["revenue"] == 1
+    pts = {k: 0 for k in P.COMPONENT_LIMITS} | {"guidance": 2, "eps": 1}
+    assert P.score_from_points(pts) == {"total_s": 4.0, "score": 0.70}
+
+
+@pytest.mark.parametrize("score, move, expected", [
+    (0.70, 0.06, 0.70),    # normal move: unchanged
+    (0.70, 0.24, 0.90),    # 4x move -> distance x2: 0.5 + 0.2*2
+    (0.70, 0.015, 0.60),   # quarter move -> distance x0.5
+    (0.30, 0.24, 0.10),
+    (0.70, None, 0.70),    # no options data: unchanged
+    (0.50, 0.24, 0.50),    # the pivot never moves
+    (0.90, 0.24, 0.95),    # capped
+])
+def test_quant_sizing(score, move, expected, monkeypatch):
+    for k in ("QUANT_POWER", "QUANT_REF_MOVE", "QUANT_PIVOT"):
+        monkeypatch.delenv(k, raising=False)
+    assert P.apply_quant(score, move) == expected
+
+
+def test_quant_can_be_switched_off(monkeypatch):
+    monkeypatch.setenv("QUANT_POWER", "0")
+    assert P.apply_quant(0.70, 0.24) == 0.70
+
+
+def test_quant_view_text():
+    text = P.quant_view(BUNDLE)
+    assert "Expected absolute move: 5.1%" in text and "No proven link" not in text  # BUNDLE has no skew
+    assert "no usable options data" in P.quant_view({"items": []})
 
 
 @pytest.mark.parametrize("a, r, expected", [
@@ -382,3 +411,31 @@ def test_filings_reach_the_context_agent_only(fake, with_context, edgar, monkeyp
     analyst_msg = client.sent[1]["messages"][1]["content"]
     assert "From SEC filings:\nQ1 release guided $91.0B +/-2%." in analyst_msg
     assert "SEC FILINGS (from EDGAR" not in analyst_msg              # raw filings stay with Context
+
+
+# ---------- trace + quant inside the pipeline ----------
+
+def test_trace_records_every_stage_and_quant_is_applied(fake, monkeypatch):
+    monkeypatch.setenv("QUANT_REF_MOVE", "0.0255")   # BUNDLE move 0.051 -> factor sqrt(2)=1.414
+    fake(sheet(guidance=2, revenue=1), sheet(guidance=2, revenue=1))
+    trace = {}
+    final = P.run_agents(bundle=BUNDLE, ticker="NVDA", event_type="EARNINGS_RELEASE", trace=trace)
+    assert trace["unsized"] == 0.65 and trace["path"] == "close_call"
+    assert final == trace["final"] == 0.70                # 0.5 + 0.15*1.414 = 0.712 -> 0.70
+    assert trace["analyst_points"]["guidance"] == 2 and trace["scrutinizer_score"] == 0.65
+    assert trace["errors"] == []
+
+
+def test_pm_sees_quant_view(fake):
+    client = fake(sheet(guidance=3, revenue=2), scrut({"guidance": "FACT", "revenue": "FACT"}, guidance=-1),
+                  {"final_score": 0.6})
+    run()
+    assert "QUANT VIEW" in client.sent[2]["messages"][1]["content"]
+
+
+def test_error_fallback_is_not_sized(fake, monkeypatch):
+    monkeypatch.setenv("QUANT_PIVOT", "0.6")
+    fake(RuntimeError("down"))
+    trace = {}
+    assert P.run_agents(bundle=BUNDLE, ticker="X", event_type="E", trace=trace) == 0.5
+    assert trace["path"] == "analyst_failed"

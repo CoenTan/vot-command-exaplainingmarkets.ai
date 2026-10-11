@@ -14,7 +14,11 @@ How one event flows:
   4. PORTFOLIO MANAGER settles it (skipped on close calls: the rubric says
      "average them", so Python does that and saves a call).
   5. Python re-does every agent's arithmetic, so a model's maths mistake can
-     never reach the submission. The answer is always on the 0.05 grid.
+     never reach the submission.
+  6. QUANT (Python, no AI) sizes the final score with the options market's
+     expected move: pivot + (score - pivot) * sqrt(move / reference_move).
+     Big expected move -> further from the middle. It never picks a direction.
+     The answer is always on the 0.05 grid.
 
 Safety nets (a missed event counts against you, so something is ALWAYS sent):
   - No OPENAI_API_KEY             -> 0.50
@@ -31,6 +35,11 @@ Optional settings in .env:
   USE_CONTEXT_AGENT          set to 0 to switch the Context agent off (iteration 1)
   USE_SEC_FILINGS            set to 0 to stop fetching SEC filings
   SEC_USER_AGENT             "Your Name your@email.com" (the SEC asks for contact info)
+  COMPONENT_WEIGHTS          e.g. "guidance=1.5,eps=0.5" (others stay 1.0); set by train/tune.py
+  QUANT_POWER                sizing strength (default 0.5 = square root; 0 = sizing off)
+  QUANT_REF_MOVE             a "normal" expected move (default 0.06 = 6%); set by train/tune.py
+  QUANT_PIVOT                centre for sizing (default 0.50); set by train/tune.py
+  BOT_QUIET                  set to 1 to hide the agents' full JSON in logs
 
 To change how agents think, edit the prompt blocks below
 (RUBRIC, CONTEXT, ANALYST, SCRUTINIZER, PORTFOLIO_MANAGER).
@@ -225,7 +234,7 @@ You score one company's earnings release. Your output is a single number on a 0.
 ## Inputs you may receive
 - `earnings-call-facts`: facts extracted from the earnings call. These are the RESULTS.
 - `earnings-preview`: a research note written BEFORE the release. These are the EXPECTATIONS: consensus, whisper/buy-side numbers, bull/base/bear scenarios, metrics to watch, setup.
-- `option-implied-stats`: implied earnings volatility, implied absolute move, 25-delta skew, all measured before the release. Any of these may be missing.
+- `option-implied-stats`: implied earnings volatility, implied absolute move, 25-delta skew, all measured before the release. Any of these may be missing. They describe how BIG a move the market expects, not its direction. You may use skew only inside the `setup` component.
 
 - `BACKGROUND`: paragraphs from the Context agent about the company and its industry. Use it to INTERPRET the materials (what matters for this company, what a metric means). It is NOT evidence: every point you score must cite the call facts or the preview, never the background. If the background conflicts with the materials, the materials win.
 
@@ -287,13 +296,8 @@ Hard rules:
 
 ## Step 3: Convert points to a score
 1. S = the sum of all seven components (range -11 to +11).
-2. base_score = 0.50 + 0.05 × S, capped to the range 0.05 to 0.95.
-3. Implied-move adjustment, using `implied_absolute_earnings_move`:
-   - 0.08 or more: move ONE step (0.05) further from 0.50
-   - 0.04 to 0.08: no change
-   - under 0.04: move ONE step (0.05) toward 0.50, but never onto 0.50 (so 0.55 and 0.45 stay put)
-   - missing or status not "ok": no change
-   - A base_score of exactly 0.50 never moves. Keep the final score within 0.05 to 0.95.
+2. score = 0.50 + 0.05 × S, capped to the range 0.05 to 0.95.
+3. Do NOT adjust for the options data yourself. A separate Quant step sizes the final score using the implied move, automatically, after all agents finish.
 
 ## Step 4: Sanity check against the bands
 | Score | S | What the print looks like |
@@ -366,7 +370,7 @@ You are a senior equity analyst on an earnings desk. You are the FIRST agent. Yo
 1. LIST THE BAR. From the preview, write down every expectation you can find: revenue consensus, revenue whisper, guidance consensus, any bull/disappointment lines, EPS consensus, the #1 metric to watch, and the setup (price action into the print, sentiment, skew).
 2. MATCH THE RESULTS. From the call facts, find the reported number for each item. If an item was not reported, mark it "N/A".
 3. SCORE all seven components. For guidance, revenue and key_metric, apply the point table to the NUMBERS mechanically (midpoints for ranges). No shaving. Write one line of evidence for every non-zero score, in the form "result vs bar (source)".
-4. CONVERT: S → base_score → implied-move adjustment → score.
+4. CONVERT: S → score (0.50 + 0.05 × S).
 5. DOUBLE-COUNT CHECK: make sure no fact is scored in two components (see the rubric's priority order). SANITY CHECK the band description. If it does not match the print, re-check your points.
 6. CASE AGAINST: in one sentence, state the strongest fact-based reason your score could be wrong. The Scrutinizer will start there.
 
@@ -388,9 +392,6 @@ Return ONLY this JSON, with no other text:
     "setup":      {"points": 0, "evidence": ""}
   },
   "total_s": 0,
-  "base_score": 0.50,
-  "implied_move": null,
-  "adjustment": "none | further | toward",
   "score": 0.50,
   "case_against": "",
   "notes": ""
@@ -409,7 +410,7 @@ You have no stake in agreeing or disagreeing. Your only goal is the scoresheet t
 2. AUDIT EACH COMPONENT. For each of the seven, re-check the evidence against the materials. Either keep the Analyst's points, or change them and give an error code from the list below.
 3. CHECK FOR SHAVING AND DOUBLE COUNTING. Recompute guidance, revenue and key_metric from the numbers with the point table. Check that no fact is scored in two components.
 4. HUNT FOR MISSED FACTS. Read every call fact. Look for anything material the Analyst did not score, such as a buried guidance cut, a segment decline, a margin reset, or a one-off that flatters the beat.
-5. CONVERT your own sheet exactly as the rubric says: S → base_score → implied-move adjustment → score.
+5. CONVERT your own sheet exactly as the rubric says: S → score (0.50 + 0.05 × S).
 6. NAME THE BIGGEST DISAGREEMENT: the one component where your points differ most from the Analyst's, and why.
 
 ## Error codes. Every change MUST cite one.
@@ -444,9 +445,6 @@ Return ONLY this JSON, with no other text:
     "setup":      {"points": 0, "evidence": ""}
   },
   "total_s": 0,
-  "base_score": 0.50,
-  "implied_move": null,
-  "adjustment": "none | further | toward",
   "score": 0.50,
   "biggest_disagreement": ""
 }
@@ -465,7 +463,7 @@ You are the portfolio manager. You are the THIRD and FINAL agent. You weigh the 
    PATH 1, CLOSE CALL: gap ≤ 0.10 AND both scores are on the same side of 0.50 (or one of them is exactly 0.50).
    - final = the average of A and R, rounded to the nearest 0.05.
    - If the average sits exactly halfway between two grid values, round AWAY from 0.50.
-   - Both inputs already include the implied-move adjustment, so do not apply it again.
+   - Do not apply any options-based sizing yourself. The Quant step does it automatically after you.
 
    PATH 2, REAL DISAGREEMENT: gap > 0.10, OR the scores sit on opposite sides of 0.50.
    - Go component by component. Where the two sheets differ, pick the side with the stronger evidence, using this ladder (strongest first):
@@ -476,13 +474,19 @@ You are the portfolio manager. You are the THIRD and FINAL agent. You weigh the 
    - If the evidence is equally strong, take the points closer to 0 (the lower absolute value).
    - Check the Scrutinizer's FACT, MISSED and SHAVE claims against the materials yourself. A verified one always wins.
    - Apply the NO DOUBLE COUNTING rule to your settled sheet. If one fact appears in two components, keep only the first (guidance > revenue > key_metric > quality > eps > tone > setup).
-   - Build the settled scoresheet, then convert exactly as the rubric says: S → base_score → implied-move adjustment → score.
+   - Build the settled scoresheet, then convert exactly as the rubric says: S → score (0.50 + 0.05 × S).
 
 3. SANITY CHECKS on the final score. Apply them in order.
    a. SCENARIO CHECK: if the preview has bear/base/bull scenarios, decide which one the results match. Match on the HEADLINE numbers: put the reported revenue and the guidance midpoint against each scenario's revenue and guidance ranges. The scenario whose ranges contain them is the match. If revenue and guidance point to different scenarios, the guidance wins. Margins and other items never change the scenario match; they only move the score within the band. The final score should sit in that scenario's band: bear ≤ 0.35, base 0.40–0.60, bull ≥ 0.65. If it does not, either give a one-sentence, fact-based reason in `scenario_override_reason`, or move the score to the nearest edge of the band.
    b. NO LAZY 0.50: the final may be 0.50 only if the settled S is 0 (Path 2), or the average is 0.50 (Path 1).
    c. EPS/TONE-ONLY: if the only non-zero components in both sheets are eps and/or tone, the final must be between 0.40 and 0.60.
    d. The final must be on the 0.05 grid and between 0.05 and 0.95.
+
+## The QUANT VIEW
+You will see a QUANT VIEW block computed from the options market: the expected size of the move and the skew.
+- It tells you how BIG a move the market expects, not which way. The competition's own analysis of 2026Q3 found skew had no relationship with the direction of the reaction, so never move the score up or down because of skew alone.
+- Use it only to understand the stakes, e.g. "the market expects a large move, so a clear beat is likely to land far from the middle."
+- Your final_score is the UNSIZED score. The Quant step sizes it automatically after you.
 
 ## Rules
 - The BACKGROUND section may help you weigh which disputed component matters more for this company. It is never evidence for a point.
@@ -587,21 +591,75 @@ def points_from_sheet(components: object) -> dict[str, int]:
     return out
 
 
-def score_from_points(points: dict[str, int], move: float | None) -> dict:
-    """The rubric's Step 3, exactly: S -> base_score -> implied-move adjustment."""
-    s = sum(points.values())
-    base = _on_grid(s)
-    steps = round((base - 0.5) / GRID)
-    adjustment = "none"
-    if move is not None and steps != 0:
-        if move >= 0.08:
-            steps += 1 if steps > 0 else -1
-            adjustment = "further"
-        elif move < 0.04:
-            steps += -1 if steps > 0 else 1
-            adjustment = "toward"
-    return {"total_s": s, "base_score": base, "adjustment": adjustment,
-            "score": _on_grid(steps)}
+def component_weights() -> dict[str, float]:
+    """Weights per component (default 1.0). Override in .env, e.g.
+    COMPONENT_WEIGHTS="guidance=1.5,eps=0.5". Bad entries are ignored."""
+    weights = {k: 1.0 for k in COMPONENT_LIMITS}
+    for part in os.environ.get("COMPONENT_WEIGHTS", "").split(","):
+        if "=" in part:
+            key, _, value = part.partition("=")
+            number = _as_number(value)
+            if key.strip() in weights and number is not None and 0 <= number <= 5:
+                weights[key.strip()] = number
+    return weights
+
+
+def score_from_points(points: dict[str, int]) -> dict:
+    """The rubric's Step 3: S = weighted sum of points -> 0.50 + 0.05 * S, on the grid."""
+    weights = component_weights()
+    s = sum(weights[k] * points.get(k, 0) for k in COMPONENT_LIMITS)
+    return {"total_s": round(s, 3), "score": _snap(_clamp(0.5 + GRID * s, LOWEST, HIGHEST))}
+
+
+def _env_number(name: str, default: float) -> float:
+    value = _as_number(os.environ.get(name, ""))
+    return default if value is None else value
+
+
+def quant_factor(move: float | None) -> float:
+    """How much to stretch the distance from the pivot: sqrt(move / reference)."""
+    power = _env_number("QUANT_POWER", 0.5)
+    ref = _env_number("QUANT_REF_MOVE", 0.06)
+    if move is None or move <= 0 or power <= 0 or ref <= 0:
+        return 1.0
+    return (move / ref) ** power
+
+
+def apply_quant(score: float, move: float | None) -> float:
+    """QUANT sizing: pivot + (score - pivot) * factor, back on the 0.05 grid."""
+    pivot = _env_number("QUANT_PIVOT", 0.5)
+    sized = pivot + (score - pivot) * quant_factor(move)
+    return _snap(_clamp(sized, LOWEST, HIGHEST))
+
+
+def quant_view(bundle: object) -> str:
+    """The QUANT VIEW text the Portfolio Manager sees."""
+    move = implied_move(bundle)
+    if move is None:
+        return "QUANT VIEW: no usable options data for this stock, so no sizing will be applied."
+    stats = {}
+    for item in (bundle.get("items") or []) if isinstance(bundle, dict) else []:
+        if isinstance(item, dict) and item.get("id") == OPTION_STATS_ID:
+            stats = item.get("content") or {}
+    def value(key: str) -> float | None:
+        block = stats.get(key) if isinstance(stats, dict) else None
+        return _as_number(block.get("value")) if isinstance(block, dict) and block.get("status") == "ok" else None
+    ref = _env_number("QUANT_REF_MOVE", 0.06)
+    factor = quant_factor(move)
+    size = "large" if move >= ref * 1.33 else "small" if move <= ref * 0.67 else "normal"
+    lines = [
+        "QUANT VIEW (computed in Python from the options market; no AI):",
+        f"- Expected absolute move: {move:.1%} ({size}; a normal move is about {ref:.1%})",
+    ]
+    vol = value("implied_earnings_volatility")
+    if vol is not None:
+        lines.append(f"- Implied earnings volatility: {vol:.1%}")
+    skew = value("skew_25_delta")
+    if skew is not None:
+        lean = "puts priced richer" if skew < 0 else "calls priced richer"
+        lines.append(f"- 25-delta skew: {skew * 100:+.1f} vol points ({lean}). No proven link to direction.")
+    lines.append(f"- After you decide, your score's distance from the middle is multiplied by {factor:.2f}.")
+    return "\n".join(lines)
 
 
 HARD_ERRORS = {"FACT", "BAR", "DOUBLE", "MISSED", "CAP", "SHAVE"}
@@ -914,6 +972,8 @@ def call_agent(role_prompt: str, user_message: str, seconds: float,
 
 
 def _log(tag: str, payload: object) -> None:
+    if os.environ.get("BOT_QUIET") == "1":
+        return
     try:
         print(f"[{tag}] " + json.dumps(payload, ensure_ascii=False)[:4000])
     except Exception:
@@ -968,12 +1028,37 @@ def get_background(context: str, ticker: str, seconds: float, filings: str = "")
 
 def run_agents(*, bundle: object, ticker: str, event_type: str,
                event_datetime: str | None = None,
-               knowledge_cutoff: str | None = None) -> float:
+               knowledge_cutoff: str | None = None,
+               trace: dict | None = None) -> float:
+    """Run the whole pipeline and return the submitted number.
+    `trace` (optional dict) is filled with every intermediate result, for training."""
+    t = trace if trace is not None else {}
+    started = time.monotonic()
+    t.update({"errors": [], "path": None})
+    unsized = _decide(bundle=bundle, ticker=ticker, event_type=event_type,
+                      event_datetime=event_datetime, knowledge_cutoff=knowledge_cutoff, t=t)
+    move = implied_move(bundle)
+    if t["path"] in ("no_key", "analyst_failed"):
+        final = unsized                       # never size an error fallback
+    else:
+        final = apply_quant(unsized, move)
+    t.update({"unsized": unsized, "final": final, "move": move,
+              "quant_factor": round(quant_factor(move), 4),
+              "seconds": round(time.monotonic() - started, 1)})
+    if final != unsized:
+        print(f"[QUANT] {ticker} {unsized} -> {final} (expected move {move:.1%})")
+    return final
+
+
+def _decide(*, bundle: object, ticker: str, event_type: str,
+            event_datetime: str | None, knowledge_cutoff: str | None, t: dict) -> float:
+    """Context -> Analyst -> Scrutinizer -> PM. Returns the UNSIZED score."""
     global _warned_no_key
     if not os.environ.get("OPENAI_API_KEY"):
         if not _warned_no_key:
             print("[WARN] OPENAI_API_KEY not set - submitting 0.5. Add it to .env and redeploy.")
             _warned_no_key = True
+        t["path"] = "no_key"
         return 0.5
 
     start = time.monotonic()
@@ -991,6 +1076,7 @@ def run_agents(*, bundle: object, ticker: str, event_type: str,
     )
 
     # 0. CONTEXT (background only, never a number; skipped on failure)
+    t["filings_chars"] = t["background_chars"] = 0
     if os.environ.get("USE_CONTEXT_AGENT", "1") != "0":
         filings = ""
         if os.environ.get("USE_SEC_FILINGS", "1") != "0":
@@ -998,6 +1084,7 @@ def run_agents(*, bundle: object, ticker: str, event_type: str,
                                   min(SEC_MAX_SECONDS, max(0.0, seconds_left() - 200.0)))
         background = get_background(context, ticker,
                                     min(CONTEXT_MAX_SECONDS, seconds_left()), filings)
+        t["filings_chars"], t["background_chars"] = len(filings), len(background)
         if background:
             context += (
                 "\n\nBACKGROUND (from the Context agent: for interpretation only, "
@@ -1010,15 +1097,20 @@ def run_agents(*, bundle: object, ticker: str, event_type: str,
                              seconds_left())
     except Exception as exc:
         print(f"[ERROR] {ticker} analyst failed: {exc!r} -> 0.5")
+        t["errors"].append(f"analyst: {exc!r}")
+        t["path"] = "analyst_failed"
         return 0.5
-    a_calc = score_from_points(points_from_sheet(analyst.get("components")), move)
+    a_pts = points_from_sheet(analyst.get("components"))
+    a_calc = score_from_points(a_pts)
     analyst.update(a_calc)                 # overwrite the model's arithmetic with ours
     a = a_calc["score"]
+    t.update({"analyst_points": a_pts, "analyst_score": a})
     _log("ANALYST", {"ticker": ticker, **analyst})
 
     # 2. SCRUTINIZER
     if seconds_left() < MIN_CALL_SECONDS:
         print(f"[TIME] {ticker} no time for scrutinizer -> analyst {a}")
+        t["path"] = "analyst_only"
         return a
     try:
         scrutinizer = call_agent(
@@ -1030,8 +1122,9 @@ def run_agents(*, bundle: object, ticker: str, event_type: str,
         )
     except Exception as exc:
         print(f"[ERROR] {ticker} scrutinizer failed: {exc!r} -> analyst {a}")
+        t["errors"].append(f"scrutinizer: {exc!r}")
+        t["path"] = "analyst_only"
         return a
-    a_pts = points_from_sheet(analyst.get("components"))
     r_pts, cap_notes = cap_judgment_changes(a_pts, scrutinizer)
     if cap_notes:
         scrutinizer["judgment_caps_applied"] = cap_notes
@@ -1043,9 +1136,10 @@ def run_agents(*, bundle: object, ticker: str, event_type: str,
                     entry["points"] = note["capped_to"]
                 else:
                     comps[note["component"]] = {"points": note["capped_to"], "evidence": ""}
-    r_calc = score_from_points(r_pts, move)
+    r_calc = score_from_points(r_pts)
     scrutinizer.update(r_calc)
     r = r_calc["score"]
+    t.update({"scrutinizer_points": r_pts, "scrutinizer_score": r, "judgment_caps": len(cap_notes)})
     _log("SCRUTINIZER", {"ticker": ticker, **scrutinizer})
 
     # 3. PORTFOLIO MANAGER
@@ -1053,9 +1147,11 @@ def run_agents(*, bundle: object, ticker: str, event_type: str,
     fallback = average_rule(a, r)
     if close_call and os.environ.get("ALWAYS_CALL_PM", "") != "1":
         print(f"[FINAL] {ticker} close call: analyst {a}, scrutinizer {r} -> {fallback}")
+        t["path"] = "close_call"
         return fallback
     if seconds_left() < MIN_CALL_SECONDS:
         print(f"[TIME] {ticker} no time for PM -> average {fallback}")
+        t["path"] = "pm_skipped_time"
         return fallback
     try:
         pm = call_agent(
@@ -1063,18 +1159,24 @@ def run_agents(*, bundle: object, ticker: str, event_type: str,
             context
             + "\n\nANALYST SCORESHEET:\n" + json.dumps(analyst, ensure_ascii=False)
             + "\n\nSCRUTINIZER SCORESHEET:\n" + json.dumps(scrutinizer, ensure_ascii=False)
+            + "\n\n" + quant_view(bundle)
             + f"\n\nVerified scores: analyst_score={a}, scrutinizer_score={r}, "
               f"gap={abs(a - r):.2f}.\n\nReturn the final JSON only.",
             seconds_left(),
         )
     except Exception as exc:
         print(f"[ERROR] {ticker} PM failed: {exc!r} -> average {fallback}")
+        t["errors"].append(f"pm: {exc!r}")
+        t["path"] = "pm_failed"
         return fallback
     final_raw = _as_number(pm.get("final_score"))
     final = _snap(final_raw) if final_raw is not None else fallback
     settled = pm.get("settled_components")
     if isinstance(settled, dict) and settled:
-        pm["python_check"] = score_from_points(points_from_sheet(settled), move)
+        settled_pts = points_from_sheet(settled)
+        pm["python_check"] = score_from_points(settled_pts)
+        t["pm_points"] = settled_pts
+    t.update({"pm_score": final, "path": "pm"})
     _log("PM", {"ticker": ticker, **pm})
     print(f"[FINAL] {ticker} analyst {a}, scrutinizer {r} -> PM {final}")
     return final
