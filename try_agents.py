@@ -30,7 +30,9 @@ rows = []
 for ev in events[:limit]:
     t0 = time.monotonic()
     score = predict.run_agents(bundle=ev["bundle"], ticker=ev["ticker"],
-                               event_type="EARNINGS_RELEASE")
+                               event_type="EARNINGS_RELEASE",
+                               event_datetime=ev.get("event_datetime"),
+                               knowledge_cutoff=ev.get("knowledge_cutoff"))
     secs = time.monotonic() - t0
     rows.append((ev["ticker"], score, ev["car1"], secs))
     print(f"--> {ev['ticker']}: predicted {score:.2f} | actual move {ev['car1']:+.1%} | {secs:.0f}s\n")
