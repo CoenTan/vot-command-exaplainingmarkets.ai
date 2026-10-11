@@ -16,7 +16,7 @@ How one event flows:
   5. Python re-does every agent's arithmetic, so a model's maths mistake can
      never reach the submission.
   6. QUANT (Python, no AI) sizes the final score with the options market's
-     expected move: pivot + (score - pivot) * sqrt(move / reference_move).
+     expected move: pivot + (score - pivot) * (move / reference_move) ** power.
      Big expected move -> further from the middle. It never picks a direction.
      The answer is always on the 0.05 grid.
 
@@ -35,10 +35,13 @@ Optional settings in .env:
   USE_CONTEXT_AGENT          set to 0 to switch the Context agent off (iteration 1)
   USE_SEC_FILINGS            set to 0 to stop fetching SEC filings
   SEC_USER_AGENT             "Your Name your@email.com" (the SEC asks for contact info)
-  COMPONENT_WEIGHTS          e.g. "guidance=1.5,eps=0.5" (others stay 1.0); set by train/tune.py
-  QUANT_POWER                sizing strength (default 0.5 = square root; 0 = sizing off)
-  QUANT_REF_MOVE             a "normal" expected move (default 0.06 = 6%); set by train/tune.py
-  QUANT_PIVOT                centre for sizing (default 0.50); set by train/tune.py
+  COMPONENT_WEIGHTS          e.g. "guidance=1.5,eps=0.5" (others keep DEFAULT_WEIGHTS); see train/tune.py
+  QUANT_POWER                sizing strength (default 0.25; 0 = sizing off)
+  QUANT_REF_MOVE             a "normal" expected move (default 0.08 = 8%, the 2026Q3 median)
+  QUANT_PIVOT                centre for sizing (default 0.55, about this bot's average score)
+
+The defaults for the weights and the QUANT settings were fitted on the
+historical archive (2025Q4-2026Q3, ~8,400 scored releases) by train/tune.py.
   BOT_QUIET                  set to 1 to hide the agents' full JSON in logs
 
 To change how agents think, edit the prompt blocks below
@@ -229,12 +232,17 @@ You score one company's earnings release. Your output is a single number on a 0.
   - 0.95 = among the best reactions of the quarter
 - Only the ORDERING of scores across companies matters. Calibration earns nothing. Do not shrink toward 0.50 out of caution. Use 0.50 only when the evidence is genuinely balanced or absent.
 - Score news RELATIVE TO EXPECTATIONS, not in absolute terms. A great quarter the market already expected is a 0.50.
-- The EPS beat/miss is the least useful signal, because everyone already sees it. Guidance, revenue and the key metric matter more.
+- You are judged only on what you explain BEYOND the EPS surprise, which the scorer already controls for. So the EPS beat/miss earns nothing: its weight is 0.
+- What does carry signal, measured on ~8,400 past releases (2025Q4-2026Q3), strongest first:
+  1. Guidance direction (raised / cut / withdrawn vs the bar). By far the strongest, every quarter. Cuts move stocks more than raises.
+  2. Management tone and risk flags. Second strongest per point.
+  3. Beats or misses against a stated bar (the key metric), and the quality of the quarter (margins, one-offs).
+  4. Revenue on its own adds little once guidance is known.
 
 ## Inputs you may receive
 - `earnings-call-facts`: facts extracted from the earnings call. These are the RESULTS.
 - `earnings-preview`: a research note written BEFORE the release. These are the EXPECTATIONS: consensus, whisper/buy-side numbers, bull/base/bear scenarios, metrics to watch, setup.
-- `option-implied-stats`: implied earnings volatility, implied absolute move, 25-delta skew, all measured before the release. Any of these may be missing. They describe how BIG a move the market expects, not its direction. You may use skew only inside the `setup` component.
+- `option-implied-stats`: implied earnings volatility, implied absolute move, 25-delta skew, all measured before the release. Any of these may be missing. They describe how BIG a move the market expects, not its direction. Skew has NO measurable link to the direction of the reaction (2026Q3: correlation 0.01 over 672 releases), so never score it, not even in `setup`.
 
 - `BACKGROUND`: paragraphs from the Context agent about the company and its industry. Use it to INTERPRET the materials (what matters for this company, what a metric means). It is NOT evidence: every point you score must cite the call facts or the preview, never the background. If the background conflicts with the materials, the materials win.
 
@@ -249,15 +257,17 @@ For each item, the bar is the HIGHEST credible expectation in the preview:
 
 ## Step 2: Score the seven components
 
-| # | key | Component | Range |
-|---|---|---|---|
-| 1 | guidance | Next-period / full-year guidance vs the bar | -3 to +3 |
-| 2 | revenue | Reported revenue vs the bar | -2 to +2 |
-| 3 | key_metric | The preview's #1 "metric to watch" that is NOT guidance or revenue (e.g. gross margin, segment revenue, subscribers) | -2 to +2 |
-| 4 | quality | Quality of the beat or miss | -1 to +1 |
-| 5 | eps | EPS vs consensus | -1 to +1 |
-| 6 | tone | Management tone and risk flags | -1 to +1 |
-| 7 | setup | Positioning going into the print | -1 to +1 |
+| # | key | Component | Range | Weight |
+|---|---|---|---|---|
+| 1 | guidance | Next-period / full-year guidance vs the bar | -3 to +3 | 1.0 |
+| 2 | revenue | Reported revenue vs the bar | -2 to +2 | 0.6 |
+| 3 | key_metric | The preview's #1 "metric to watch" that is NOT guidance or revenue (e.g. gross margin, segment revenue, subscribers). With no preview: the result the company itself compares to a stated bar (its own prior guidance, "above/below expectations") | -2 to +2 | 0.7 |
+| 4 | quality | Quality of the beat or miss | -1 to +1 | 0.6 |
+| 5 | eps | EPS vs consensus | -1 to +1 | 0 |
+| 6 | tone | Management tone and risk flags | -1 to +1 | 1.0 |
+| 7 | setup | Positioning going into the print | -1 to +1 | 1.0 |
+
+Score every component on its points scale as below. The weights are applied in Step 3 (in code); they never change how you award points.
 
 How to score guidance, revenue and key_metric: compare NUMBERS, mechanically.
 - If a result or expectation is a range (e.g. "$108B ±2%", "$94-95B"), use its MIDPOINT.
@@ -284,33 +294,36 @@ Uncertainty is handled by the Scrutinizer and the Portfolio Manager, not by you.
 
 Components 4-7:
 - quality: +1 = margin expansion, beat driven by core demand. -1 = beat flattered by one-offs, tax, buybacks or accounting, or margins compressing. 0 = neither. If key_metric is already a margin, quality may NOT score margins again.
-- eps: +1 = beat consensus. -1 = missed. 0 = in line or N/A.
-- tone: +1 = specific, confident commentary backed by numbers. -1 = new risks, hedging, executive departure, investigation, demand warnings. 0 = neither. Tone may only use facts NOT already scored in another component. "Demand exceeds supply" is not a negative.
-- setup: +1 = expectations were LOW going in (stock fell into the print, negative skew, bearish sentiment) AND results were at least in line. -1 = expectations were STRETCHED (big run-up, euphoric sentiment, crowded) AND results were not clearly above the bar. 0 = otherwise.
+- eps: +1 = beat consensus. -1 = missed. 0 = in line or N/A. Weight 0: record it (it keeps the EPS fact out of other components) but it does not move the score. Never use an EPS beat or miss as evidence anywhere else.
+- tone: +1 = specific, confident commentary backed by numbers (record results, accelerating growth, demand clearly strengthening). -1 = new risk flags: investigation, lawsuit, restatement, executive departure, impairment or write-down, layoffs, delays, demand softness or weakness, new headwinds, rising uncertainty. 0 = neither. Tone may only use facts NOT already scored in another component. "Demand exceeds supply" is not a negative. Tone is the second-strongest signal per point: when the facts show a clear risk flag or clear confidence, score it; do not leave it at 0 out of caution.
+- setup: +1 = expectations were LOW going in (stock fell into the print, bearish sentiment, per the preview) AND results were at least in line. -1 = expectations were STRETCHED (big run-up, euphoric sentiment, crowded) AND results were not clearly above the bar. 0 = otherwise, or no preview. Never use option skew.
 
 Hard rules:
 - Every non-zero point must cite evidence: the result, the bar, and the source (facts or preview).
 - NO DOUBLE COUNTING. Each fact scores in ONE component only. Before you finish, check every fact you used. If one fact appears in two or more components, keep it ONLY in the first of these and set it to 0 in the others: guidance > revenue > key_metric > quality > eps > tone > setup. Example: a gross-margin reset scored in key_metric cannot also lower quality or tone.
-- eps and tone can never exceed ±1. They may tip a score but never drive it.
+- eps and tone can never exceed ±1.
 - No adjustments outside the rubric. If something important fits no component, write it in `notes`. It does not change the score.
 
 ## Step 3: Convert points to a score
-1. S = the sum of all seven components (range -11 to +11).
-2. score = 0.50 + 0.05 × S, capped to the range 0.05 to 0.95.
-3. Do NOT adjust for the options data yourself. A separate Quant step sizes the final score using the implied move, automatically, after all agents finish.
+1. S = the WEIGHTED sum of the seven components:
+   S = 1.0×guidance + 0.6×revenue + 0.7×key_metric + 0.6×quality + 0×eps + 1.0×tone + 1.0×setup
+   (range about -8.2 to +8.2).
+2. score = 0.50 + 0.05 × S, rounded to the 0.05 grid, capped to the range 0.05 to 0.95.
+3. Python redoes this arithmetic from your points and overwrites yours. Your job is to get the POINTS right.
+4. Do NOT adjust for the options data yourself. A separate Quant step sizes the final score using the implied move, automatically, after all agents finish.
 
 ## Step 4: Sanity check against the bands
-| Score | S | What the print looks like |
+| Score | weighted S | What the print looks like |
 |---|---|---|
-| 0.95 | +9 or more | Blowout: guidance, revenue and key metric all clear the whisper |
-| 0.80-0.90 | +6 to +8 | Clear beat-and-raise above the real bar |
-| 0.65-0.75 | +3 to +5 | Good: beats the bar on most items, nothing alarming |
+| 0.85-0.90 | +7 or more | Blowout: guidance, revenue and key metric all clear the whisper, confident tone |
+| 0.75-0.80 | +5 to +6 | Clear beat-and-raise above the real bar |
+| 0.65-0.70 | +3 to +4 | Good: guidance up or beats the bar on most items, nothing alarming |
 | 0.55-0.60 | +1 to +2 | Modestly positive, or mixed leaning good |
 | 0.50 | 0 | In line, or genuinely balanced |
 | 0.40-0.45 | -1 to -2 | Modestly negative, or mixed leaning bad |
-| 0.25-0.35 | -3 to -5 | Misses the bar on a key item, or guidance below expectations |
-| 0.10-0.20 | -6 to -8 | Clear miss plus weak guidance |
-| 0.05 | -9 or less | Disaster: big miss, guidance cut, major new negative |
+| 0.30-0.35 | -3 to -4 | Guidance below the bar, or misses the bar on a key item |
+| 0.20-0.25 | -5 to -6 | Clear miss plus weak guidance |
+| 0.10-0.15 | -7 or less | Disaster: guidance cut, big miss, major new risk flag |
 
 If the description for your band does not match the print, re-check your points. Never change the final number without changing points.
 """
@@ -370,7 +383,7 @@ You are a senior equity analyst on an earnings desk. You are the FIRST agent. Yo
 1. LIST THE BAR. From the preview, write down every expectation you can find: revenue consensus, revenue whisper, guidance consensus, any bull/disappointment lines, EPS consensus, the #1 metric to watch, and the setup (price action into the print, sentiment, skew).
 2. MATCH THE RESULTS. From the call facts, find the reported number for each item. If an item was not reported, mark it "N/A".
 3. SCORE all seven components. For guidance, revenue and key_metric, apply the point table to the NUMBERS mechanically (midpoints for ranges). No shaving. Write one line of evidence for every non-zero score, in the form "result vs bar (source)".
-4. CONVERT: S → score (0.50 + 0.05 × S).
+4. CONVERT: weighted S → score (0.50 + 0.05 × S), as in Step 3.
 5. DOUBLE-COUNT CHECK: make sure no fact is scored in two components (see the rubric's priority order). SANITY CHECK the band description. If it does not match the print, re-check your points.
 6. CASE AGAINST: in one sentence, state the strongest fact-based reason your score could be wrong. The Scrutinizer will start there.
 
@@ -410,7 +423,7 @@ You have no stake in agreeing or disagreeing. Your only goal is the scoresheet t
 2. AUDIT EACH COMPONENT. For each of the seven, re-check the evidence against the materials. Either keep the Analyst's points, or change them and give an error code from the list below.
 3. CHECK FOR SHAVING AND DOUBLE COUNTING. Recompute guidance, revenue and key_metric from the numbers with the point table. Check that no fact is scored in two components.
 4. HUNT FOR MISSED FACTS. Read every call fact. Look for anything material the Analyst did not score, such as a buried guidance cut, a segment decline, a margin reset, or a one-off that flatters the beat.
-5. CONVERT your own sheet exactly as the rubric says: S → score (0.50 + 0.05 × S).
+5. CONVERT your own sheet exactly as the rubric says: weighted S → score (0.50 + 0.05 × S).
 6. NAME THE BIGGEST DISAGREEMENT: the one component where your points differ most from the Analyst's, and why.
 
 ## Error codes. Every change MUST cite one.
@@ -474,13 +487,13 @@ You are the portfolio manager. You are the THIRD and FINAL agent. You weigh the 
    - If the evidence is equally strong, take the points closer to 0 (the lower absolute value).
    - Check the Scrutinizer's FACT, MISSED and SHAVE claims against the materials yourself. A verified one always wins.
    - Apply the NO DOUBLE COUNTING rule to your settled sheet. If one fact appears in two components, keep only the first (guidance > revenue > key_metric > quality > eps > tone > setup).
-   - Build the settled scoresheet, then convert exactly as the rubric says: S → score (0.50 + 0.05 × S).
+   - Build the settled scoresheet, then convert exactly as the rubric says: weighted S → score (0.50 + 0.05 × S).
+   - On this path Python recomputes the final score from your `settled_components` with the weighted formula. The POINTS are what count; get them right.
 
-3. SANITY CHECKS on the final score. Apply them in order.
-   a. SCENARIO CHECK: if the preview has bear/base/bull scenarios, decide which one the results match. Match on the HEADLINE numbers: put the reported revenue and the guidance midpoint against each scenario's revenue and guidance ranges. The scenario whose ranges contain them is the match. If revenue and guidance point to different scenarios, the guidance wins. Margins and other items never change the scenario match; they only move the score within the band. The final score should sit in that scenario's band: bear ≤ 0.35, base 0.40–0.60, bull ≥ 0.65. If it does not, either give a one-sentence, fact-based reason in `scenario_override_reason`, or move the score to the nearest edge of the band.
-   b. NO LAZY 0.50: the final may be 0.50 only if the settled S is 0 (Path 2), or the average is 0.50 (Path 1).
-   c. EPS/TONE-ONLY: if the only non-zero components in both sheets are eps and/or tone, the final must be between 0.40 and 0.60.
-   d. The final must be on the 0.05 grid and between 0.05 and 0.95.
+3. SANITY CHECKS on the settled sheet. Apply them in order.
+   a. SCENARIO CHECK: if the preview has bear/base/bull scenarios, decide which one the results match. Match on the HEADLINE numbers: put the reported revenue and the guidance midpoint against each scenario's revenue and guidance ranges. The scenario whose ranges contain them is the match. If revenue and guidance point to different scenarios, the guidance wins. Margins and other items never change the scenario match; they only move the score within the band. The score should sit in that scenario's band: bear ≤ 0.35, base 0.40–0.60, bull ≥ 0.65. If it does not, re-check the settled points against the materials. Change a component only for a fact-based reason, and write that reason in `scenario_override_reason`. Never change the number without changing points.
+   b. NO LAZY ZEROS: do not set a component to 0 out of caution when the evidence supports points.
+   c. The final must be on the 0.05 grid and between 0.05 and 0.95.
 
 ## The QUANT VIEW
 You will see a QUANT VIEW block computed from the options market: the expected size of the move and the skew.
@@ -591,10 +604,24 @@ def points_from_sheet(components: object) -> dict[str, int]:
     return out
 
 
+# Fitted by train/tune.py on 2025Q4-2026Q3: each weight is the component's
+# effect on the return rank beyond the EPS surprise, per point, relative to
+# guidance. eps is 0 because the scorer already controls for the surprise;
+# setup could not be measured (it needs the preview) and stays at 1.0.
+DEFAULT_WEIGHTS = {
+    "guidance": 1.0, "revenue": 0.6, "key_metric": 0.7,
+    "quality": 0.6, "eps": 0.0, "tone": 1.0, "setup": 1.0,
+}
+# QUANT sizing defaults, tuned on 2026Q3 (the only quarter with options data).
+QUANT_POWER_DEFAULT = 0.25
+QUANT_REF_MOVE_DEFAULT = 0.08
+QUANT_PIVOT_DEFAULT = 0.55
+
+
 def component_weights() -> dict[str, float]:
-    """Weights per component (default 1.0). Override in .env, e.g.
+    """Weights per component (default DEFAULT_WEIGHTS). Override in .env, e.g.
     COMPONENT_WEIGHTS="guidance=1.5,eps=0.5". Bad entries are ignored."""
-    weights = {k: 1.0 for k in COMPONENT_LIMITS}
+    weights = dict(DEFAULT_WEIGHTS)
     for part in os.environ.get("COMPONENT_WEIGHTS", "").split(","):
         if "=" in part:
             key, _, value = part.partition("=")
@@ -617,9 +644,9 @@ def _env_number(name: str, default: float) -> float:
 
 
 def quant_factor(move: float | None) -> float:
-    """How much to stretch the distance from the pivot: sqrt(move / reference)."""
-    power = _env_number("QUANT_POWER", 0.5)
-    ref = _env_number("QUANT_REF_MOVE", 0.06)
+    """How much to stretch the distance from the pivot: (move / reference) ** power."""
+    power = _env_number("QUANT_POWER", QUANT_POWER_DEFAULT)
+    ref = _env_number("QUANT_REF_MOVE", QUANT_REF_MOVE_DEFAULT)
     if move is None or move <= 0 or power <= 0 or ref <= 0:
         return 1.0
     return (move / ref) ** power
@@ -627,7 +654,7 @@ def quant_factor(move: float | None) -> float:
 
 def apply_quant(score: float, move: float | None) -> float:
     """QUANT sizing: pivot + (score - pivot) * factor, back on the 0.05 grid."""
-    pivot = _env_number("QUANT_PIVOT", 0.5)
+    pivot = _env_number("QUANT_PIVOT", QUANT_PIVOT_DEFAULT)
     sized = pivot + (score - pivot) * quant_factor(move)
     return _snap(_clamp(sized, LOWEST, HIGHEST))
 
@@ -644,7 +671,7 @@ def quant_view(bundle: object) -> str:
     def value(key: str) -> float | None:
         block = stats.get(key) if isinstance(stats, dict) else None
         return _as_number(block.get("value")) if isinstance(block, dict) and block.get("status") == "ok" else None
-    ref = _env_number("QUANT_REF_MOVE", 0.06)
+    ref = _env_number("QUANT_REF_MOVE", QUANT_REF_MOVE_DEFAULT)
     factor = quant_factor(move)
     size = "large" if move >= ref * 1.33 else "small" if move <= ref * 0.67 else "normal"
     lines = [
@@ -1173,8 +1200,12 @@ def _decide(*, bundle: object, ticker: str, event_type: str,
     final = _snap(final_raw) if final_raw is not None else fallback
     settled = pm.get("settled_components")
     if isinstance(settled, dict) and settled:
+        # The settled points are what count: re-score them with the trained
+        # weights, so the model's own arithmetic never reaches the submission.
         settled_pts = points_from_sheet(settled)
         pm["python_check"] = score_from_points(settled_pts)
+        pm["model_final_score"] = final
+        final = pm["python_check"]["score"]
         t["pm_points"] = settled_pts
     t.update({"pm_score": final, "path": "pm"})
     _log("PM", {"ticker": ticker, **pm})
