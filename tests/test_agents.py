@@ -1,4 +1,4 @@
-"""Offline tests for the 3-agent pipeline: no API key spent, no network.
+"""Offline tests for the agent pipeline (v02 rubric): no API key spent, no network.
 
 A fake OpenAI client returns canned JSON for each agent, so we can check the
 arithmetic, the close-call / disagreement paths, and every fallback.
@@ -24,10 +24,13 @@ BUNDLE = {"items": [
     {"id": "option-implied-stats", "kind": "stats", "content": STATS},
 ]}
 
+# short names for the dimensions used in tests
+G, F, RV = "guidance_revision", "forward_operating_outlook", "revenue_growth"
+
 
 def sheet(**pts) -> dict:
-    return {"components": {k: {"points": v, "evidence": "x"} for k, v in pts.items()},
-            "score": 0.99, "total_s": 999}  # deliberately wrong maths: Python must override
+    return {"components": {k: {"score": v, "evidence": "x"} for k, v in pts.items()},
+            "score": 0.99, "weighted_total": 999}  # deliberately wrong maths: Python must override
 
 
 class FakeClient:
@@ -51,13 +54,14 @@ class FakeClient:
 def fake(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     monkeypatch.delenv("ALWAYS_CALL_PM", raising=False)
-    monkeypatch.setenv("USE_CONTEXT_AGENT", "0")   # iteration-1 tests; context tests switch it on
+    monkeypatch.delenv("CLOSE_CALL_GAP", raising=False)
+    monkeypatch.setenv("USE_CONTEXT_AGENT", "0")   # context tests switch it on
     monkeypatch.setenv("USE_SEC_FILINGS", "0")     # never touch the network in tests
-    # Pipeline tests check the flow with the original, simple arithmetic
-    # (every weight 1, square-root sizing around 0.50 vs a 6% move). The
-    # trained defaults are tested on their own below.
-    monkeypatch.setenv("COMPONENT_WEIGHTS", ",".join(f"{k}=1" for k in P.COMPONENT_LIMITS))
-    monkeypatch.setenv("QUANT_POWER", "0.5")
+    # Pipeline tests use simple arithmetic: every weight 1, so
+    # score = 0.5 + (sum of dimension scores) / 20, and no Quant sizing.
+    # The real v02 weights and sizing are tested on their own below.
+    monkeypatch.setenv("COMPONENT_WEIGHTS", ",".join(f"{k}=1" for k in P.DIMENSIONS))
+    monkeypatch.setenv("QUANT_POWER", "0")
     monkeypatch.setenv("QUANT_REF_MOVE", "0.06")
     monkeypatch.setenv("QUANT_PIVOT", "0.5")
 
@@ -74,45 +78,55 @@ def run(bundle=BUNDLE):
 
 # ---------- arithmetic ----------
 
-def test_points_are_clamped_and_summed():
-    pts = P.points_from_sheet({"guidance": {"points": 7}, "eps": {"points": -4}, "tone": "1"})
-    assert pts["guidance"] == 3 and pts["eps"] == -1 and pts["tone"] == 1 and pts["revenue"] == 0
+def test_v02_has_17_dimensions_and_weights_sum_to_one():
+    assert len(P.DIMENSIONS) == 17
+    assert abs(sum(P.DEFAULT_WEIGHTS.values()) - 1.0) < 1e-9
+    assert P.DEFAULT_WEIGHTS[G] == 0.31 and P.DEFAULT_WEIGHTS[F] == 0.2
 
 
-@pytest.mark.parametrize("s, expected", [
-    (0, 0.50), (3, 0.65), (-3, 0.35), (11, 0.95), (-11, 0.05),
+def test_every_dimension_is_in_every_scoring_prompt():
+    for prompt in (P.ANALYST, P.SCRUTINIZER, P.PORTFOLIO_MANAGER):
+        for d in P.DIMENSIONS:
+            assert f'"{d}"' in prompt
+    assert "## Boundaries" in P.RUBRIC and "## Worked TRAIN examples" in P.RUBRIC
+
+
+def test_scores_are_read_and_clamped():
+    pts = P.points_from_sheet({G: {"score": 17}, "new_risks": {"points": -4.5}, "gross_margin": "3"})
+    assert pts[G] == 10 and pts["new_risks"] == -4.5 and pts["gross_margin"] == 3 and pts[RV] == 0
+
+
+@pytest.mark.parametrize("total, expected", [
+    (0, 0.50), (4, 0.70), (-4, 0.30), (30, 0.999), (-30, 0.001), (1.3, 0.565),
 ])
-def test_score_from_points(s, expected, monkeypatch):
-    monkeypatch.delenv("COMPONENT_WEIGHTS", raising=False)
-    pts = {k: 0 for k in P.COMPONENT_LIMITS}
-    pts["guidance"] = s  # bypass clamp on purpose to test the conversion only
-    assert P.score_from_points(pts)["score"] == expected
+def test_score_from_points(total, expected, monkeypatch):
+    monkeypatch.setenv("COMPONENT_WEIGHTS", ",".join(f"{k}=1" for k in P.DIMENSIONS))
+    assert P.score_from_points({G: total})["score"] == expected
 
 
 def test_component_weights_from_env(monkeypatch):
-    monkeypatch.setenv("COMPONENT_WEIGHTS", "guidance=2, eps=0, bogus=9, tone=abc, revenue=99")
+    monkeypatch.setenv("COMPONENT_WEIGHTS", f"{G}=0.5, bogus=9, new_risks=abc, gross_margin=99")
     w = P.component_weights()
-    assert w["guidance"] == 2 and w["eps"] == 0
-    assert w["tone"] == P.DEFAULT_WEIGHTS["tone"] and w["revenue"] == P.DEFAULT_WEIGHTS["revenue"]
-    pts = {k: 0 for k in P.COMPONENT_LIMITS} | {"guidance": 2, "eps": 1}
-    assert P.score_from_points(pts) == {"total_s": 4.0, "score": 0.70}
+    assert w[G] == 0.5
+    assert w["new_risks"] == P.DEFAULT_WEIGHTS["new_risks"]
+    assert w["gross_margin"] == P.DEFAULT_WEIGHTS["gross_margin"]
 
 
-def test_trained_default_weights(monkeypatch):
+def test_v02_default_weights(monkeypatch):
     monkeypatch.delenv("COMPONENT_WEIGHTS", raising=False)
     assert P.component_weights() == P.DEFAULT_WEIGHTS
-    # an EPS beat alone earns nothing: the scorer already controls for the surprise
-    assert P.score_from_points({"eps": 1})["score"] == 0.50
-    # guidance +2, revenue +2, tone -1 -> 2 + 1.2 - 1 = 2.2 -> 0.61 -> 0.60
-    assert P.score_from_points({"guidance": 2, "revenue": 2, "tone": -1}) == {"total_s": 2.2, "score": 0.60}
+    # guidance_revision +10 alone: 0.31 x 10 = 3.1 -> 0.5 + 3.1/20 = 0.655
+    assert P.score_from_points({G: 10}) == {"weighted_total": 3.1, "total_s": 3.1, "score": 0.655}
+    # +5 guidance, +5 forward outlook: 1.55 + 1.0 = 2.55 -> 0.6275
+    assert P.score_from_points({G: 5, F: 5})["score"] == 0.6275
 
 
-def test_trained_quant_defaults(monkeypatch):
+def test_quant_defaults(monkeypatch):
     for k in ("QUANT_POWER", "QUANT_REF_MOVE", "QUANT_PIVOT"):
         monkeypatch.delenv(k, raising=False)
     assert P.apply_quant(0.70, 0.08) == 0.70       # median move: unchanged
-    assert P.apply_quant(0.75, 0.32) == 0.85       # 4x move -> distance x1.41 around 0.55
-    assert P.apply_quant(0.55, 0.32) == 0.55       # the pivot never moves
+    assert P.apply_quant(0.70, 0.32) == 0.7828     # 4x move -> distance x 4^0.25 = 1.414
+    assert P.apply_quant(0.50, 0.32) == 0.50       # the pivot never moves
     assert P.apply_quant(0.70, None) == 0.70
 
 
@@ -123,7 +137,7 @@ def test_trained_quant_defaults(monkeypatch):
     (0.30, 0.24, 0.10),
     (0.70, None, 0.70),    # no options data: unchanged
     (0.50, 0.24, 0.50),    # the pivot never moves
-    (0.90, 0.24, 0.95),    # capped
+    (0.90, 0.24, 0.999),   # capped
 ])
 def test_quant_sizing(score, move, expected, monkeypatch):
     monkeypatch.setenv("QUANT_POWER", "0.5")
@@ -144,9 +158,7 @@ def test_quant_view_text():
 
 
 @pytest.mark.parametrize("a, r, expected", [
-    (0.65, 0.60, 0.65),  # 0.625 tie -> away from 0.50
-    (0.40, 0.35, 0.35),  # 0.375 tie -> away from 0.50
-    (0.60, 0.70, 0.65),
+    (0.65, 0.60, 0.625), (0.40, 0.35, 0.375), (0.60, 0.70, 0.65),
 ])
 def test_average_rule(a, r, expected):
     assert P.average_rule(a, r) == expected
@@ -155,39 +167,46 @@ def test_average_rule(a, r, expected):
 # ---------- pipeline paths ----------
 
 def test_close_call_averages_without_calling_pm(fake):
-    client = fake(sheet(guidance=2, revenue=1), sheet(guidance=2))
-    assert run() == 0.65          # analyst S=3 -> 0.65, scrutinizer S=2 -> 0.60, tie -> 0.65
+    client = fake(sheet(**{G: 4, RV: 2}), sheet(**{G: 4, RV: 1}))
+    assert run() == 0.775         # analyst 6 -> 0.80, scrutinizer 5 -> 0.75, gap 0.05 -> average
     assert len(client.sent) == 2  # PM skipped
 
 
-def test_disagreement_calls_pm_and_snaps_its_answer(fake):
-    client = fake(sheet(guidance=3, revenue=2), scrut({"guidance": "FACT", "revenue": "FACT"}, guidance=-1),
-                  {"final_score": 0.58})
-    assert run() == 0.60          # no settled sheet: 0.58 snapped to grid
+def test_close_call_gap_can_be_set(fake, monkeypatch):
+    monkeypatch.setenv("CLOSE_CALL_GAP", "0.01")
+    client = fake(sheet(**{G: 4, RV: 2}), sheet(**{G: 4, RV: 1}), {"final_score": 0.77})
+    assert run() == 0.77
+    assert len(client.sent) == 3  # gap 0.05 > 0.01 -> PM called
+
+
+def test_disagreement_calls_pm(fake):
+    client = fake(sheet(**{G: 6}), scrut({G: "FACT"}, **{G: -2}), {"final_score": 0.58})
+    assert run() == 0.58          # no settled sheet: the PM's number, kept as is
     assert len(client.sent) == 3
     pm_msg = client.sent[2]["messages"][1]["content"]
-    assert "analyst_score=0.75" in pm_msg and "scrutinizer_score=0.45" in pm_msg
+    assert "analyst_score=0.8" in pm_msg and "scrutinizer_score=0.4" in pm_msg
 
 
-def test_pm_settled_points_are_rescored_in_python(fake):
-    fake(sheet(guidance=3, revenue=2), scrut({"guidance": "FACT", "revenue": "FACT"}, guidance=-1),
-         {"final_score": 0.80, "settled_components": {"guidance": 2, "revenue": 1}})
+def test_pm_settled_scores_are_rescored_in_python(fake):
+    fake(sheet(**{G: 6}), scrut({G: "FACT"}, **{G: -2}),
+         {"final_score": 0.80, "settled_components": {G: 2, RV: 1}})
     trace = {}
     final = P.run_agents(bundle=BUNDLE, ticker="NVDA", event_type="EARNINGS_RELEASE", trace=trace)
-    assert trace["pm_score"] == 0.65   # S = 3 -> 0.65, not the model's 0.80
-    assert final == 0.65               # sized: 0.5 + 0.15 * sqrt(5.1% / 6%) = 0.638 -> 0.65
+    assert trace["pm_score"] == 0.65   # total 3 -> 0.65, not the model's 0.80
+    assert final == 0.65
+    assert trace["pm_points"][G] == 2
 
 
 def test_models_maths_is_overwritten_before_the_next_agent_sees_it(fake):
-    client = fake(sheet(guidance=2), sheet(guidance=2))
+    client = fake(sheet(**{G: 2}), sheet(**{G: 2}))
     run()
     sent_to_scrutinizer = client.sent[1]["messages"][1]["content"]
-    assert '"score": 0.6' in sent_to_scrutinizer and '"total_s": 2' in sent_to_scrutinizer
+    assert '"score": 0.6' in sent_to_scrutinizer and '"weighted_total": 2.0' in sent_to_scrutinizer
 
 
 def test_json_inside_code_fences_is_accepted(fake):
-    fake("```json\n" + json.dumps(sheet(revenue=2)) + "\n```", sheet(revenue=2))
-    assert run() == 0.60
+    fake("```json\n" + json.dumps(sheet(**{RV: 4})) + "\n```", sheet(**{RV: 4}))
+    assert run() == 0.70
 
 
 def test_rubric_is_sent_with_every_role(fake):
@@ -195,7 +214,7 @@ def test_rubric_is_sent_with_every_role(fake):
     run()
     for call in client.sent:
         system = call["messages"][0]["content"]
-        assert "UNIVERSAL SCORING RUBRIC" in system
+        assert "UNIVERSAL SCORING RUBRIC (v02)" in system
         assert call["response_format"] == {"type": "json_object"}
 
 
@@ -212,24 +231,24 @@ def test_analyst_failure_returns_half(fake):
 
 
 def test_scrutinizer_failure_returns_analyst(fake):
-    fake(sheet(guidance=3, revenue=2), RuntimeError("timeout"))
-    assert run() == 0.75
+    fake(sheet(**{G: 6}), RuntimeError("timeout"))
+    assert run() == 0.80
 
 
 def test_pm_failure_returns_average(fake):
-    fake(sheet(guidance=3, revenue=2), scrut({"guidance": "FACT", "revenue": "FACT"}, guidance=-1), RuntimeError("timeout"))
-    assert run() == 0.60          # (0.75 + 0.45) / 2
+    fake(sheet(**{G: 6}), scrut({G: "FACT"}, **{G: -2}), RuntimeError("timeout"))
+    assert run() == 0.60          # (0.80 + 0.40) / 2
 
 
 def test_pm_garbage_returns_average(fake):
-    fake(sheet(guidance=3, revenue=2), scrut({"guidance": "FACT", "revenue": "FACT"}, guidance=-1), {"final_score": "high"})
+    fake(sheet(**{G: 6}), scrut({G: "FACT"}, **{G: -2}), {"final_score": "high"})
     assert run() == 0.60
 
 
 def test_out_of_time_skips_remaining_agents(fake, monkeypatch):
-    client = fake(sheet(guidance=3, revenue=2))
+    client = fake(sheet(**{G: 6}))
     monkeypatch.setattr(P, "TOTAL_BUDGET_SECONDS", 10.0)  # less than MIN_CALL_SECONDS
-    assert run() == 0.75
+    assert run() == 0.80
     assert len(client.sent) == 1
 
 
@@ -241,7 +260,7 @@ def test_implied_move_read_from_bundle():
     assert P.implied_move(bad) is None
 
 
-# ---------- judgment cap (from the real NVDA run, 2026-10-11) ----------
+# ---------- judgment cap ----------
 
 def scrut(audit, **pts) -> dict:
     out = sheet(**pts)
@@ -249,30 +268,35 @@ def scrut(audit, **pts) -> dict:
     return out
 
 
-def test_big_judgment_change_is_cut_to_one_point():
-    a = P.points_from_sheet(sheet(tone=-1, setup=1)["components"])
-    r_sheet = scrut({"key_metric": "JUDGMENT", "quality": "JUDGMENT"},
-                    key_metric=-2, quality=-1, tone=-1, setup=1)
+def test_big_judgment_change_is_cut_to_three_points():
+    a = P.points_from_sheet(sheet()["components"])
+    r_sheet = scrut({G: "JUDGMENT", "gross_margin": "JUDGMENT"}, **{G: -5, "gross_margin": -2})
     pts, notes = P.cap_judgment_changes(a, r_sheet)
-    assert pts["key_metric"] == -1          # 0 -> -2 under JUDGMENT is capped at -1
-    assert pts["quality"] == -1             # 0 -> -1 is allowed
-    assert [n["component"] for n in notes] == ["key_metric"]
+    assert pts[G] == -3                     # 0 -> -5 under JUDGMENT is capped at -3
+    assert pts["gross_margin"] == -2        # 0 -> -2 is allowed
+    assert [n["component"] for n in notes] == [G]
 
 
-def test_hard_error_codes_may_move_more_than_one_point():
-    a = P.points_from_sheet(sheet(guidance=0, revenue=0)["components"])
-    r_sheet = scrut({"guidance": "SHAVE", "revenue": "bar"}, guidance=3, revenue=2)
+def test_unlisted_big_change_is_capped_too():
+    a = P.points_from_sheet(sheet(**{F: 6})["components"])
+    pts, notes = P.cap_judgment_changes(a, sheet(**{F: -2}))   # no audit row at all
+    assert pts[F] == 3 and len(notes) == 1
+
+
+def test_hard_error_codes_may_move_more_than_three_points():
+    a = P.points_from_sheet(sheet()["components"])
+    r_sheet = scrut({G: "SHAVE", RV: "bar"}, **{G: 8, RV: 6})
     pts, notes = P.cap_judgment_changes(a, r_sheet)
-    assert pts["guidance"] == 3 and pts["revenue"] == 2 and notes == []
+    assert pts[G] == 8 and pts[RV] == 6 and notes == []
 
 
 def test_cap_is_applied_before_scoring_and_shown_to_pm(fake):
-    client = fake(sheet(guidance=3, revenue=2),
-                  scrut({"guidance": "JUDGMENT"}, guidance=-2, revenue=2),
-                  {"final_score": 0.7})
-    run()
-    # scrutinizer's guidance -2 capped to +2: S = 4 -> 0.70; analyst S = 5 -> 0.75 -> close call
-    assert len(client.sent) == 2
+    client = fake(sheet(**{G: 6}), scrut({G: "JUDGMENT"}, **{G: 0}), {"final_score": 0.7})
+    trace = {}
+    P.run_agents(bundle=BUNDLE, ticker="NVDA", event_type="EARNINGS_RELEASE", trace=trace)
+    assert trace["scrutinizer_points"][G] == 3 and trace["judgment_caps"] == 1
+    assert trace["scrutinizer_score"] == 0.65
+    assert "judgment_caps_applied" in client.sent[2]["messages"][1]["content"]
 
 
 # ---------- iteration 2: the Context agent ----------
@@ -294,8 +318,8 @@ def with_context(monkeypatch):
 
 
 def test_context_runs_first_and_reaches_every_later_agent(fake, with_context):
-    client = fake(CONTEXT_REPLY, sheet(guidance=3, revenue=2),
-                  scrut({"guidance": "FACT", "revenue": "FACT"}, guidance=-1),
+    client = fake(CONTEXT_REPLY, sheet(**{G: 6}),
+                  scrut({G: "FACT"}, **{G: -2}),
                   {"final_score": 0.6})
     assert run() == 0.60
     assert len(client.sent) == 4
@@ -310,19 +334,19 @@ def test_context_runs_first_and_reaches_every_later_agent(fake, with_context):
 
 
 def test_context_failure_does_not_stop_the_pipeline(fake, with_context):
-    client = fake(RuntimeError("context timeout"), sheet(guidance=2), sheet(guidance=2))
+    client = fake(RuntimeError("context timeout"), sheet(**{G: 2}), sheet(**{G: 2}))
     assert run() == 0.60
     assert "BACKGROUND" not in client.sent[1]["messages"][1]["content"]
 
 
 def test_context_junk_is_ignored(fake, with_context):
-    client = fake({"score": 0.9, "company": ""}, sheet(guidance=2), sheet(guidance=2))
+    client = fake({"score": 0.9, "company": ""}, sheet(**{G: 2}), sheet(**{G: 2}))
     assert run() == 0.60
     assert "BACKGROUND" not in client.sent[1]["messages"][1]["content"]
 
 
 def test_context_can_be_switched_off(fake):
-    client = fake(sheet(guidance=2), sheet(guidance=2))   # USE_CONTEXT_AGENT=0 from the fixture
+    client = fake(sheet(**{G: 2}), sheet(**{G: 2}))   # USE_CONTEXT_AGENT=0 from the fixture
     assert run() == 0.60
     assert "ROLE: ANALYST" in client.sent[0]["messages"][0]["content"]
 
@@ -438,7 +462,7 @@ def test_unknown_ticker_gives_empty(edgar):
 def test_filings_reach_the_context_agent_only(fake, with_context, edgar, monkeypatch):
     monkeypatch.setenv("USE_SEC_FILINGS", "1")
     client = fake(CONTEXT_REPLY | {"filings_digest": "Q1 release guided $91.0B +/-2%."},
-                  sheet(guidance=2), sheet(guidance=2))
+                  sheet(**{G: 2}), sheet(**{G: 2}))
     P.run_agents(bundle=BUNDLE, ticker="NVDA", event_type="EARNINGS_RELEASE",
                  event_datetime="2026-08-26T21:00:00+00:00")
     context_msg = client.sent[0]["messages"][1]["content"]
@@ -451,18 +475,19 @@ def test_filings_reach_the_context_agent_only(fake, with_context, edgar, monkeyp
 # ---------- trace + quant inside the pipeline ----------
 
 def test_trace_records_every_stage_and_quant_is_applied(fake, monkeypatch):
+    monkeypatch.setenv("QUANT_POWER", "0.5")
     monkeypatch.setenv("QUANT_REF_MOVE", "0.0255")   # BUNDLE move 0.051 -> factor sqrt(2)=1.414
-    fake(sheet(guidance=2, revenue=1), sheet(guidance=2, revenue=1))
+    fake(sheet(**{G: 2, RV: 1}), sheet(**{G: 2, RV: 1}))
     trace = {}
     final = P.run_agents(bundle=BUNDLE, ticker="NVDA", event_type="EARNINGS_RELEASE", trace=trace)
     assert trace["unsized"] == 0.65 and trace["path"] == "close_call"
-    assert final == trace["final"] == 0.70                # 0.5 + 0.15*1.414 = 0.712 -> 0.70
-    assert trace["analyst_points"]["guidance"] == 2 and trace["scrutinizer_score"] == 0.65
+    assert final == trace["final"] == 0.7121              # 0.5 + 0.15*1.414 = 0.7121
+    assert trace["analyst_points"][G] == 2 and trace["scrutinizer_score"] == 0.65
     assert trace["errors"] == []
 
 
 def test_pm_sees_quant_view(fake):
-    client = fake(sheet(guidance=3, revenue=2), scrut({"guidance": "FACT", "revenue": "FACT"}, guidance=-1),
+    client = fake(sheet(**{G: 6}), scrut({G: "FACT"}, **{G: -2}),
                   {"final_score": 0.6})
     run()
     assert "QUANT VIEW" in client.sent[2]["messages"][1]["content"]
@@ -474,3 +499,25 @@ def test_error_fallback_is_not_sized(fake, monkeypatch):
     trace = {}
     assert P.run_agents(bundle=BUNDLE, ticker="X", event_type="E", trace=trace) == 0.5
     assert trace["path"] == "analyst_failed"
+
+
+def test_hard_deadline_cuts_off_slow_call():
+    import time as _t
+    import predict as P
+    started = _t.monotonic()
+    try:
+        P._hard_deadline(lambda: _t.sleep(5), 0.5)
+        raise AssertionError("should have timed out")
+    except TimeoutError:
+        pass
+    assert _t.monotonic() - started < 2
+
+
+def test_hard_deadline_passes_result_and_errors():
+    import predict as P
+    assert P._hard_deadline(lambda: 42, 2) == 42
+    try:
+        P._hard_deadline(lambda: (_ for _ in ()).throw(ValueError("x")), 2)
+        raise AssertionError("should have raised")
+    except ValueError:
+        pass
