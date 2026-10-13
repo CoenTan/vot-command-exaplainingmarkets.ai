@@ -89,6 +89,8 @@ def test_every_dimension_is_in_every_scoring_prompt():
         for d in P.DIMENSIONS:
             assert f'"{d}"' in prompt
     assert "## Boundaries" in P.RUBRIC and "## Worked TRAIN examples" in P.RUBRIC
+    # v02.1: guidance is scored against the highest investor bar
+    assert "AMENDMENT v02.1" in P.RUBRIC and "HIGHEST investor bar" in P.RUBRIC
 
 
 def test_scores_are_read_and_clamped():
@@ -214,7 +216,7 @@ def test_rubric_is_sent_with_every_role(fake):
     run()
     for call in client.sent:
         system = call["messages"][0]["content"]
-        assert "UNIVERSAL SCORING RUBRIC (v02)" in system
+        assert "UNIVERSAL SCORING RUBRIC (v02.1)" in system
         assert call["response_format"] == {"type": "json_object"}
 
 

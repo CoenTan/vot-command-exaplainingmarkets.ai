@@ -1,5 +1,7 @@
 """VOT COMMAND, iteration 3: Context -> Analyst -> Scrutinizer -> Portfolio Manager,
-scored with the v02 rubric (17 dimensions, -10..+10, ported from the v2 bot).
+scored with the v02.1 rubric: the v2 bot's v02 (17 dimensions, -10..+10) plus one
+amendment that scores guidance against investor expectations (whisper > consensus >
+the company's prior guidance).
 
 THIS IS THE ONLY FILE YOU EDIT. Everything else in the repo is plumbing.
 
@@ -225,7 +227,7 @@ def format_materials(bundle: object) -> str:
 # ----------------------------------------------------------------------
 
 RUBRIC = r"""
-# UNIVERSAL SCORING RUBRIC (v02)
+# UNIVERSAL SCORING RUBRIC (v02.1)
 
 How this rubric maps to this system (read first):
 - Every scoring agent fills a `components` sheet with ALL 17 dimensions below, each scored from -10 to +10 (fractions allowed).
@@ -233,6 +235,27 @@ How this rubric maps to this system (read first):
 - Python is authoritative for the arithmetic. It recomputes weighted_total and the percentile from your dimension scores and overwrites your own numbers, so get the SCORES right.
 - The objective is the RANK of this stock's one-day, market-adjusted reaction among all releases this quarter, beyond what the EPS-surprise percentile already explains. Only the ordering across companies is judged.
 - Option skew is never evidence of direction.
+
+## AMENDMENT v02.1: how guidance_revision is scored (overrides the v02 text below wherever they differ)
+Markets react to new guidance relative to what investors EXPECTED, not only relative to the company's own old guidance. So guidance_revision scores the NEW forward guidance (next-quarter or full-year revenue / operating guidance) against the HIGHEST investor bar available, in this order:
+  1. the preview's bull line or buy-side / whisper number
+  2. Street consensus for that guided metric
+  3. the company's own prior guidance (the original v02 rule)
+Name the bar you used in the evidence line.
+
+Which guidance to score: the guided metric the preview ranks as most important. If the preview does not rank them, next-quarter guidance comes first. Other horizons (e.g. a full-year raise) may move the score by at most 3 points either way; a full-year raise cannot turn a next-quarter guide that misses the bar into a positive score.
+
+Scale against an investor bar (gap = guided midpoint vs the bar, in %):
+  +8 to +10  clears the whisper / bull line by 3% or more
+  +4 to +7   clears the whisper / bull line by less than 3%
+  -3 to +3   between consensus and the whisper / bull line (meets the Street, not what investors hoped for); closer to the whisper -> closer to 0
+  -4 to -7   below consensus by less than 3%
+  -8 to -10  below consensus by 3% or more, or guidance withdrawn
+  If only consensus is available: +5 to +8 above it by 3% or more; +2 to +4 above it by less than 3%; mirror these for shortfalls.
+  If no investor bar exists: use the original v02 criteria (revision vs the company's prior guidance).
+A tax- or share-count-driven EPS guidance change is still not an operating raise.
+
+expectations_gap now covers CURRENT-period reported results (revenue, KPIs, margins) against Street / preview bars only. A guidance-versus-expectations comparison is scored once, in guidance_revision, never in expectations_gap.
 
 ---
 
@@ -270,9 +293,9 @@ Use each economic comparison once. Distinct periods, metrics or independent marg
 
 ## Boundaries
 
-- guidance_revision: Not to be confused with forward_operating_outlook: score the revision to an old bar here, not the level of the same projection twice.
+- guidance_revision: Not to be confused with forward_operating_outlook: score new guidance against the highest investor bar here (see AMENDMENT v02.1); do not score the level of the same projection twice.
 - forward_operating_outlook: Not to be confused with guidance_revision: use a different metric/period, or forward profitability ratio; a shared revenue denominator is allowed, duplicate numerator/comparison is not.
-- expectations_gap: Not to be confused with guidance_revision/revenue_growth: reserve an explicit Street or preview comparison here; EPS surprise and option-implied movement alone are not direction.
+- expectations_gap: Not to be confused with guidance_revision/revenue_growth: reserve an explicit Street or preview comparison of CURRENT-period results here; guidance-versus-expectations belongs in guidance_revision (AMENDMENT v02.1). EPS surprise and option-implied movement alone are not direction.
 - revenue_growth: Not to be confused with organic_comparable_growth: use only one for the same current sales series unless an independent explicit sales-bar comparison exists.
 - organic_comparable_growth: Not to be confused with volume_price_mix: allocate aggregate underlying growth here or its decomposition there; do not reward both without distinct evidence.
 - volume_price_mix: Not to be confused with operating_kpi: assign a particular unit/price comparison to only one; a different brand/metric can support the other.
@@ -620,7 +643,7 @@ You are a senior equity analyst on an earnings desk. You are the FIRST scoring a
 ## Procedure
 0. READ THE BACKGROUND. Use the Context agent's background to understand which drivers matter most for this company and industry. It guides your reading; it is never evidence for a score.
 1. LIST THE BARS. From the preview: Street consensus, whisper / buy-side expectations, bull and bear lines, the ranked metrics to watch. From the BACKGROUND's filings digest: the company's own prior guidance. From the call facts: the company's own prior ranges and year-over-year / sequential comparisons. Label which bar you use for each comparison; never invent a Street number.
-2. SCORE EVERY DIMENSION from -10 to +10 with the Criteria table. Interpolate between the -10/-5/0/+5/+10 anchors; fractions are fine; use the whole range when the evidence is strong. Zero means balanced evidence, truly absent evidence, or a comparison allocated to another dimension under the Boundaries.
+2. SCORE EVERY DIMENSION from -10 to +10 with the Criteria table. Score guidance_revision with AMENDMENT v02.1 (new guidance vs the highest investor bar). Interpolate between the -10/-5/0/+5/+10 anchors; fractions are fine; use the whole range when the evidence is strong. Zero means balanced evidence, truly absent evidence, or a comparison allocated to another dimension under the Boundaries.
 3. EVIDENCE: for every non-zero score, one short line: "fact (F# or preview section) vs bar -> why this score". Leave evidence empty for zeros.
 4. BOUNDARY CHECK: each economic comparison earns credit once (see Boundaries). The EPS beat itself earns nothing anywhere. A tax- or share-count-driven EPS guide change is not an operating raise.
 5. CASE AGAINST: one sentence giving the strongest fact-based reason your overall picture could be wrong. The Scrutinizer starts there.
