@@ -117,7 +117,8 @@ def test_a_long_preview_never_costs_the_facts_or_the_statistics() -> None:
     text = predict_module.format_materials(_bundle(FACTS_ITEM, long_preview, STATS_ITEM))
     assert "1. Revenue rose 12% year over year." in text
     assert "Implied earnings volatility: 8.5%" in text
-    assert text.endswith("[preview truncated]")
+    assert "[preview truncated]" in text
+    assert text.startswith("Research note written BEFORE the release")   # preview goes first
     kept = predict_module.PREVIEW_MAX_CHARS - len("# Preview\n")
     assert "x" * kept in text and "x" * (kept + 1) not in text
 

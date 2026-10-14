@@ -55,8 +55,7 @@ def fake(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
     monkeypatch.delenv("ALWAYS_CALL_PM", raising=False)
     monkeypatch.delenv("CLOSE_CALL_GAP", raising=False)
-    monkeypatch.setenv("USE_CONTEXT_AGENT", "0")   # context tests switch it on
-    monkeypatch.setenv("USE_SEC_FILINGS", "0")     # never touch the network in tests
+    monkeypatch.delenv("OPENAI_REASONING_EFFORT", raising=False)
     # Pipeline tests use simple arithmetic: every weight 1, so
     # score = 0.5 + (sum of dimension scores) / 20, and no Quant sizing.
     # The real v02 weights and sizing are tested on their own below.
@@ -228,8 +227,39 @@ def test_no_key_returns_half(monkeypatch):
 
 
 def test_analyst_failure_returns_half(fake):
-    fake(RuntimeError("down"))
+    fake(RuntimeError("down"), RuntimeError("still down"))
     assert run() == 0.5
+
+
+def test_analyst_is_retried_once_at_default_effort(fake):
+    client = fake(RuntimeError("too slow"), sheet(**{G: 2}), sheet(**{G: 2}))
+    trace = {}
+    assert P.run_agents(bundle=BUNDLE, ticker="NVDA", event_type="E", trace=trace) == 0.60
+    assert client.sent[0]["reasoning_effort"] == "high"      # first try: high effort
+    assert "reasoning_effort" not in client.sent[1]          # retry: model default
+    assert trace["analyst_retried"] is True
+
+
+def test_scoring_agents_use_high_effort_by_default(fake, monkeypatch):
+    client = fake(sheet(**{G: 6}), scrut({G: "FACT"}, **{G: -2}), {"final_score": 0.5})
+    run()
+    assert [c["reasoning_effort"] for c in client.sent] == ["high", "high", "high"]  # Analyst, Scrutinizer, PM
+    monkeypatch.setenv("OPENAI_REASONING_EFFORT", "xhigh")
+    client = fake(sheet(**{G: 2}), sheet(**{G: 2}))
+    run()
+    assert all(c["reasoning_effort"] == "xhigh" for c in client.sent)
+
+
+def test_preview_comes_before_the_call_facts(fake):
+    client = fake(sheet(), sheet())
+    run()
+    user = client.sent[0]["messages"][1]["content"]
+    assert user.index("Research note written BEFORE") < user.index("Facts from the earnings call")
+
+
+def test_rule_zero_is_the_first_line_of_every_prompt():
+    for prompt in (P.RUBRIC, P.ANALYST, P.SCRUTINIZER, P.PORTFOLIO_MANAGER):
+        assert prompt.lstrip().startswith("RULE ZERO: Every fact you use must come from the materials")
 
 
 def test_scrutinizer_failure_returns_analyst(fake):
@@ -301,177 +331,34 @@ def test_cap_is_applied_before_scoring_and_shown_to_pm(fake):
     assert "judgment_caps_applied" in client.sent[2]["messages"][1]["content"]
 
 
-# ---------- iteration 2: the Context agent ----------
+# ---------- materials only: no outside research ----------
 
-CONTEXT_REPLY = {
-    "company": "Designs GPUs and networking for data centers.",
-    "industry": "AI infrastructure; hyperscaler capex drives demand.",
-    "what_moves_the_stock": "Next-quarter guide vs the buy-side bar matters most.",
-    "reaction_history": "Has sold off on beats when guidance only met the whisper.",
-    "storyline_into_print": "Debate over gross margin and China.",
-    "key_terms": "ACIE: AI cloud, industrial and enterprise customers.",
-    "reading_guide": "Compare the Q3 guide with the $105B bull line.",
-}
-
-
-@pytest.fixture
-def with_context(monkeypatch):
-    monkeypatch.setenv("USE_CONTEXT_AGENT", "1")
-
-
-def test_context_runs_first_and_reaches_every_later_agent(fake, with_context):
-    client = fake(CONTEXT_REPLY, sheet(**{G: 6}),
-                  scrut({G: "FACT"}, **{G: -2}),
-                  {"final_score": 0.6})
+def test_no_agent_ever_fetches_outside_information(fake, monkeypatch):
+    """Only the event's own materials: nothing may touch the network but OpenAI."""
+    def blocked(*args, **kwargs):
+        raise AssertionError("an agent tried to fetch outside information")
+    monkeypatch.setattr(P.httpx, "get", blocked)
+    monkeypatch.setenv("USE_CONTEXT_AGENT", "1")   # old switches must do nothing now
+    monkeypatch.setenv("USE_SEC_FILINGS", "1")
+    client = fake(sheet(**{G: 2}), sheet(**{G: 2}))
     assert run() == 0.60
-    assert len(client.sent) == 4
-    context_system = client.sent[0]["messages"][0]["content"]
-    assert "ROLE: CONTEXT AGENT" in context_system
-    assert "UNIVERSAL SCORING RUBRIC" not in context_system     # context never gets scoring rules
-    for later in client.sent[1:]:
-        user = later["messages"][1]["content"]
-        assert "BACKGROUND (from the Context agent" in user
-        assert "Compare the Q3 guide with the $105B bull line." in user
-        assert "UNIVERSAL SCORING RUBRIC" in later["messages"][0]["content"]
-
-
-def test_context_failure_does_not_stop_the_pipeline(fake, with_context):
-    client = fake(RuntimeError("context timeout"), sheet(**{G: 2}), sheet(**{G: 2}))
-    assert run() == 0.60
-    assert "BACKGROUND" not in client.sent[1]["messages"][1]["content"]
-
-
-def test_context_junk_is_ignored(fake, with_context):
-    client = fake({"score": 0.9, "company": ""}, sheet(**{G: 2}), sheet(**{G: 2}))
-    assert run() == 0.60
-    assert "BACKGROUND" not in client.sent[1]["messages"][1]["content"]
-
-
-def test_context_can_be_switched_off(fake):
-    client = fake(sheet(**{G: 2}), sheet(**{G: 2}))   # USE_CONTEXT_AGENT=0 from the fixture
-    assert run() == 0.60
+    assert len(client.sent) == 2                    # Analyst + Scrutinizer only
     assert "ROLE: ANALYST" in client.sent[0]["messages"][0]["content"]
 
 
-# ---------- SEC filings (mocked EDGAR; no network) ----------
-
-from datetime import datetime, timezone  # noqa: E402
-
-TICKERS = {"0": {"cik_str": 1045810, "ticker": "NVDA", "title": "NVIDIA CORP"}}
-SUBMISSIONS = {"filings": {"recent": {
-    "form":               ["8-K", "4", "8-K", "10-Q", "8-K", "8-K"],
-    "accessionNumber":    ["0001045810-26-000200", "x", "0001045810-26-000150",
-                           "0001045810-26-000120", "0001045810-26-000100", "0001045810-26-000090"],
-    "filingDate":         ["2026-08-26", "2026-08-20", "2026-07-15", "2026-05-29", "2026-05-28", "2026-03-01"],
-    "acceptanceDateTime": ["2026-08-26T20:20:00.000Z", "2026-08-20T20:00:00.000Z",
-                           "2026-07-15T21:00:00.000Z", "2026-05-29T20:00:00.000Z",
-                           "2026-05-28T20:20:00.000Z", "2026-03-01T20:00:00.000Z"],
-    "reportDate":         ["2026-08-26", "", "2026-07-14", "2026-04-26", "2026-05-28", ""],
-    "primaryDocument":    ["q2.htm", "f4.xml", "ceo.htm", "nvda-10q.htm", "q1.htm", "old.htm"],
-    "items":              ["2.02,9.01", "", "5.02", "", "2.02,9.01", "8.01"],
-}}}
-INDEX_HTML = """<table><tr><td>1</td><td>8-K</td><td><a href="/Archives/edgar/data/1045810/000104581026000100/q1.htm">q1.htm</a></td><td>8-K</td></tr>
-<tr><td>2</td><td>PRESS RELEASE</td><td><a href="/Archives/edgar/data/1045810/000104581026000100/q1fy27pr.htm">q1fy27pr.htm</a></td><td>EX-99.1</td></tr></table>"""
-RELEASE_HTML = "<html><p>NVIDIA Announces Financial Results for First Quarter Fiscal 2027</p>" + \
-    "<p>Revenue of $81.6 billion.</p>" + "<p>filler</p>" * 900 + \
-    "<p>Outlook: Revenue is expected to be $91.0 billion, plus or minus 2%.</p></html>"
-TENQ_HTML = ("<html><ix:header><hidden>XBRL junk</hidden></ix:header>"
-             "<p>Item 2. Management's Discussion and Analysis of Financial Condition 25</p>"
-             "<p>Item 3. Quantitative and Qualitative Disclosures 40</p>"
-             + "<p>other text</p>" * 50 +
-             "<p>Item 2. Management&#8217;s Discussion and Analysis of Financial Condition and Results</p>"
-             "<p>Data Center revenue grew 21% sequentially driven by Blackwell.</p>" + "<p>more</p>" * 100 +
-             "<p>Item 3. Quantitative and Qualitative Disclosures About Market Risk</p><p>after</p></html>")
+def test_every_agent_is_told_materials_only():
+    assert "MATERIALS ONLY" in P.RUBRIC
+    for prompt in (P.ANALYST, P.SCRUTINIZER, P.PORTFOLIO_MANAGER):
+        assert "MATERIALS ONLY" in prompt
+    assert not hasattr(P, "sec_dossier") and not hasattr(P, "CONTEXT")
 
 
-class FakeResp:
-    def __init__(self, body):
-        self._body = body
-        self.text = body if isinstance(body, str) else json.dumps(body)
-        self.content = self.text.encode()
-
-    def json(self):
-        return self._body
-
-
-@pytest.fixture
-def edgar(monkeypatch):
-    calls = []
-
-    def fake_get(url, timeout):
-        calls.append(url)
-        if url.endswith("company_tickers.json"):
-            return FakeResp(TICKERS)
-        if "submissions" in url:
-            return FakeResp(SUBMISSIONS)
-        if url.endswith("-index.htm"):
-            return FakeResp(INDEX_HTML)
-        if url.endswith("q1fy27pr.htm"):
-            return FakeResp(RELEASE_HTML)
-        if url.endswith("nvda-10q.htm"):
-            return FakeResp(TENQ_HTML)
-        raise AssertionError("unexpected SEC url " + url)
-
-    monkeypatch.setattr(P, "_sec_get", fake_get)
-    monkeypatch.setattr(P, "_ticker_to_cik", None)
-    return calls
-
-
-CUTOFF = P.filings_cutoff("2026-08-26T21:00:00+00:00", "2026-08-26T20:00:00+00:00")
-
-
-def test_cutoff_is_24h_before_event_or_the_official_cutoff():
-    assert CUTOFF == datetime(2026, 8, 25, 21, 0, tzinfo=timezone.utc)
-    wmt = P.filings_cutoff("2026-08-20T12:00:00+00:00", "2026-08-19T20:00:00+00:00")
-    assert wmt == datetime(2026, 8, 19, 12, 0, tzinfo=timezone.utc)
-
-
-def test_release_day_filings_are_never_used(edgar):
-    used = P.eligible_filings(SUBMISSIONS, CUTOFF)
-    assert "0001045810-26-000200" not in [f["accession"] for f in used]   # this quarter's results
-    assert used[0]["accession"] == "x"                                     # newest eligible first
-
-
-def test_dossier_has_previous_release_mdna_and_other_8ks(edgar):
-    text = P.sec_dossier("NVDA", CUTOFF, 20)
-    assert "PREVIOUS EARNINGS RELEASE (8-K filed 2026-05-28" in text
-    assert "Revenue of $81.6 billion" in text
-    assert "Revenue is expected to be $91.0 billion" in text          # the outlook paragraph survives
-    assert "Data Center revenue grew 21% sequentially" in text        # real MD&A, not the contents page
-    assert "XBRL junk" not in text and "after" not in text.split("MD&A excerpt")[1][-200:]
-    assert "- 2026-07-15: 8-K - 5.02 Director or officer change" in text
-    assert "2026-08-26" not in text.split("accepted before")[1][30:]  # nothing from release day
-    assert not any("000104581026000200" in u for u in edgar)          # never even downloaded
-
-
-def test_dossier_returns_empty_on_failure(monkeypatch):
-    def boom(url, timeout):
-        raise RuntimeError("sec down")
-    monkeypatch.setattr(P, "_sec_get", boom)
-    monkeypatch.setattr(P, "_ticker_to_cik", None)
-    assert P.sec_dossier("NVDA", CUTOFF, 20) == ""
-
-
-def test_dossier_respects_time_budget(edgar):
-    assert P.sec_dossier("NVDA", CUTOFF, 1) == ""
-    assert edgar == []
-
-
-def test_unknown_ticker_gives_empty(edgar):
-    assert P.sec_dossier("ZZZZ", CUTOFF, 20) == ""
-
-
-def test_filings_reach_the_context_agent_only(fake, with_context, edgar, monkeypatch):
-    monkeypatch.setenv("USE_SEC_FILINGS", "1")
-    client = fake(CONTEXT_REPLY | {"filings_digest": "Q1 release guided $91.0B +/-2%."},
-                  sheet(**{G: 2}), sheet(**{G: 2}))
-    P.run_agents(bundle=BUNDLE, ticker="NVDA", event_type="EARNINGS_RELEASE",
-                 event_datetime="2026-08-26T21:00:00+00:00")
-    context_msg = client.sent[0]["messages"][1]["content"]
-    assert "SEC FILINGS (from EDGAR" in context_msg
-    analyst_msg = client.sent[1]["messages"][1]["content"]
-    assert "From SEC filings:\nQ1 release guided $91.0B +/-2%." in analyst_msg
-    assert "SEC FILINGS (from EDGAR" not in analyst_msg              # raw filings stay with Context
+def test_agents_see_only_the_event_materials(fake):
+    client = fake(sheet(**{G: 2}), sheet(**{G: 2}))
+    run()
+    user = client.sent[0]["messages"][1]["content"]
+    assert "Revenue $96B." in user and "whisper $95B" in user
+    assert "BACKGROUND" not in user and "SEC FILINGS" not in user
 
 
 # ---------- trace + quant inside the pipeline ----------
@@ -497,7 +384,7 @@ def test_pm_sees_quant_view(fake):
 
 def test_error_fallback_is_not_sized(fake, monkeypatch):
     monkeypatch.setenv("QUANT_PIVOT", "0.6")
-    fake(RuntimeError("down"))
+    fake(RuntimeError("down"), RuntimeError("down"))
     trace = {}
     assert P.run_agents(bundle=BUNDLE, ticker="X", event_type="E", trace=trace) == 0.5
     assert trace["path"] == "analyst_failed"

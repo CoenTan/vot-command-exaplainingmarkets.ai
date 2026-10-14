@@ -1,4 +1,4 @@
-"""VOT COMMAND, iteration 3: Context -> Analyst -> Scrutinizer -> Portfolio Manager,
+"""VOT COMMAND, iteration 4: Analyst -> Scrutinizer -> Portfolio Manager, MATERIALS ONLY,
 scored with the v02.1 rubric: the v2 bot's v02 (17 dimensions, -10..+10) plus one
 amendment that scores guidance against investor expectations (whisper > consensus >
 the company's prior guidance).
@@ -6,12 +6,9 @@ the company's prior guidance).
 THIS IS THE ONLY FILE YOU EDIT. Everything else in the repo is plumbing.
 
 How one event flows:
-  1. Fetch the event's materials (call facts, preview, option stats).
-  1b. SEC FILINGS: fetch the previous earnings release, latest 10-Q/10-K MD&A
-     and recent 8-Ks from EDGAR. Only filings accepted 24h+ before the event
-     (knowledge-cutoff safe). Hard 20s cap; skipped on any problem.
-  1c. CONTEXT writes background on the company, industry and filings
-     (paragraphs, no number). Every later agent reads it; never evidence.
+  1. Fetch the event's materials (preview FIRST, then call facts, option stats). This is
+     the ONLY information any agent sees: no SEC filings, no web, no research
+     step, and every prompt forbids using the model's own outside knowledge.
   2. ANALYST scores all 17 rubric dimensions from -10 to +10.
   3. SCRUTINIZER audits the Analyst and scores it again.
   4. PORTFOLIO MANAGER settles it (skipped on close calls: Python averages
@@ -25,20 +22,14 @@ How one event flows:
 
 Safety nets (a missed event counts against you, so something is ALWAYS sent):
   - No OPENAI_API_KEY             -> 0.50
-  - SEC fetch fails / slow        -> context runs without filings
-  - Context fails / slow          -> carry on without background
   - Analyst fails                 -> 0.50
   - Scrutinizer fails / no time   -> Analyst's score
   - PM fails / no time            -> average of Analyst and Scrutinizer
 
 Optional settings in .env:
   OPENAI_MODEL               model for every agent (default: the starter's default)
-  OPENAI_REASONING_EFFORT    e.g. low / medium / high (leave unset if unsure)
+  OPENAI_REASONING_EFFORT    effort for every agent (default: high); e.g. medium / high / xhigh
   ALWAYS_CALL_PM             set to 1 to call the PM even on close calls
-  USE_CONTEXT_AGENT          set to 0 to switch the Context agent off (iteration 1)
-  USE_SEC_FILINGS            set to 0 to stop fetching SEC filings
-  SEC_USER_AGENT             "Your Name your@email.com" (the SEC asks for contact info)
-  CONTEXT_REASONING_EFFORT   effort for the Context agent only (e.g. low)
   COMPONENT_WEIGHTS          e.g. "guidance_revision=0.4" (others keep the v02 weights)
   CLOSE_CALL_GAP             max Analyst/Scrutinizer gap that skips the PM (default 0.05)
   QUANT_POWER                sizing strength (default 0.25; 0 = sizing off)
@@ -49,12 +40,11 @@ The 17 dimension weights are the v02 rubric's (rubric/weights.json in the v2 bot
   BOT_QUIET                  set to 1 to hide the agents' full JSON in logs
 
 To change how agents think, edit the prompt blocks below
-(RUBRIC, CONTEXT, ANALYST, SCRUTINIZER, PORTFOLIO_MANAGER).
+(RUBRIC, ANALYST, SCRUTINIZER, PORTFOLIO_MANAGER).
 """
 
 from __future__ import annotations
 
-import html
 import json
 import math
 import os
@@ -62,7 +52,6 @@ import queue
 import re
 import threading
 import time
-from datetime import datetime, timedelta, timezone
 
 import httpx
 from openai import OpenAI
@@ -75,10 +64,12 @@ from explaining_markets.config import openai_model
 # ----------------------------------------------------------------------
 SUMMARY_TIMEOUT_SECONDS = 15.0
 TOTAL_BUDGET_SECONDS = 240.0   # all agents together
-CONTEXT_MAX_SECONDS = 75.0     # the Context agent gets at most this
-SEC_MAX_SECONDS = 20.0         # all SEC fetching together, hard cap
-MAX_CALL_SECONDS = 110.0       # one agent call at most
+MAX_CALL_SECONDS = 150.0       # one agent call at most (high effort needs room)
 MIN_CALL_SECONDS = 25.0        # don't start a call with less time than this
+# Reasoning effort for Analyst, Scrutinizer and PM when OPENAI_REASONING_EFFORT
+# is not set. The organisers' Q3 2026 test: with the preview, more effort
+# explains more (GPT-6 Sol: medium 0.281 -> xhigh 0.299 total R2).
+SCORING_EFFORT_DEFAULT = "high"
 
 _client: OpenAI | None = None  # lazy: importing this file must not need a key
 _warned_no_key = False
@@ -185,6 +176,17 @@ def format_materials(bundle: object) -> str:
     by_id = {i.get("id"): i for i in items}
     sections: list[str] = []
 
+    # The preview goes FIRST, like the competition's own baseline: the model
+    # reads what investors expected before it reads what was reported.
+    preview = (by_id.get(PREVIEW_ID) or {}).get("content")
+    if isinstance(preview, str) and preview.strip():
+        text = preview[:PREVIEW_MAX_CHARS]
+        if len(preview) > PREVIEW_MAX_CHARS:
+            text += "\n[preview truncated]"
+        sections.append(
+            "Research note written BEFORE the release (expectations, not results):\n" + text
+        )
+
     facts = (by_id.get(FACTS_ID) or {}).get("content")
     if isinstance(facts, list) and facts:
         sections.append(
@@ -208,30 +210,25 @@ def format_materials(bundle: object) -> str:
             label = item.get("id") or item.get("kind") or "item"
             sections.append(f"Additional material ({label}):\n{content[:OTHER_ITEM_MAX_CHARS]}")
 
-    preview = (by_id.get(PREVIEW_ID) or {}).get("content")
-    if isinstance(preview, str) and preview.strip():
-        text = preview[:PREVIEW_MAX_CHARS]
-        if len(preview) > PREVIEW_MAX_CHARS:
-            text += "\n[preview truncated]"
-        sections.append(
-            "Research note written BEFORE the release (expectations, not results):\n" + text
-        )
 
     return "\n\n".join(sections)
 
 
 
 # ----------------------------------------------------------------------
-# THE PROMPTS. Scoring agents get their role block + the RUBRIC.
-# The CONTEXT agent gets only its own block (it never scores).
+# THE PROMPTS. Every agent gets its role block + the RUBRIC.
+# No agent ever receives anything except the event's own materials.
 # ----------------------------------------------------------------------
 
 RUBRIC = r"""
+RULE ZERO: Every fact you use must come from the materials given to you in this message. No hallucination, no fabrication, no outside knowledge. If something is not in the materials, it does not exist for this task.
+
 # UNIVERSAL SCORING RUBRIC (v02.1)
 
 How this rubric maps to this system (read first):
 - Every scoring agent fills a `components` sheet with ALL 17 dimensions below, each scored from -10 to +10 (fractions allowed).
-- "Dossier", "comparator" and "point-in-time context" mean what this system supplies before the release: the earnings preview, the option statistics, and the BACKGROUND (including its SEC filings digest). The call facts are the F1-F10 of the worked examples.
+- MATERIALS ONLY. Use nothing except the event's own materials: the call facts, the earnings preview and the option statistics. Do not use your memory or general knowledge of the company, its industry, its past results, its past guidance, its stock history or any news. If a bar or comparison is not in the materials, treat it as unavailable.
+- "Dossier", "comparator" and "point-in-time context" mean only what the materials contain: the earnings preview and the option statistics. The call facts are the F1-F10 of the worked examples.
 - Python is authoritative for the arithmetic. It recomputes weighted_total and the percentile from your dimension scores and overwrites your own numbers, so get the SCORES right.
 - The objective is the RANK of this stock's one-day, market-adjusted reaction among all releases this quarter, beyond what the EPS-surprise percentile already explains. Only the ordering across companies is judged.
 - Option skew is never evidence of direction.
@@ -590,59 +587,15 @@ Unlisted dimensions score 0.
 Weighted total **+8.0200** → Python implied anchor **0.9010**; realised within-quarter percentile **0.9567**, surprise residual **+0.3970**. Teaching band [0.9, 1].
 """
 
-CONTEXT = r"""
-# ROLE: CONTEXT AGENT
-
-You are a senior industry research associate. You are the FIRST agent, and you run before the Analyst, the Scrutinizer and the Portfolio Manager. Your job is to give them the background they need to interpret this earnings release correctly: who the company is, how its industry works, and what investors in this kind of stock care about.
-
-You do NOT score. You do NOT predict. You never give a number, a percentile, a rating, or a bullish/bearish verdict. Other agents do that. You only inform.
-
-## What the other agents will score (so you know what background is useful)
-They score 17 operating drivers against expectations: guidance revisions, the forward operating outlook, the gap to Street/preview bars, revenue and organic growth, volume/price/mix, gross margin, operating leverage, cash conversion, quality of the beat, operating KPIs, forward demand (orders, bookings), segment breadth, execution visibility, balance sheet and liquidity, capital return, and new risks. The bars that matter most are prior company guidance, consensus and the preview's buy-side lines. Your background should help them judge those items correctly.
-
-## Your inputs
-- MATERIALS: the event packet (call facts, preview, option statistics).
-- SEC FILINGS (when available): excerpts fetched from SEC EDGAR, ALL filed at least a day before this release: the previous quarter's earnings press release, the MD&A of the latest 10-Q/10-K, and a list of other 8-K filings since then. These are primary sources and are more reliable than your memory.
-
-## Write these sections, in paragraphs, with real detail
-1. company: what the company does, its main segments and products, how it makes money (business model, main revenue drivers, customers), its rough size and position in its market.
-2. industry: how the industry works, its current cycle and main themes, the key competitors, and the forces that move the whole sector (demand, pricing, costs, regulation, rates, technology shifts).
-3. what_moves_the_stock: the specific metrics and signals investors in THIS company and industry react to at earnings, and why. Examples: for SaaS, remaining performance obligations and net revenue retention; for retailers, comparable sales, traffic and margins; for banks, net interest income and credit costs; for semiconductors, data-center revenue, gross margin and the next-quarter guide. Say which matters most here and which matter less.
-4. reaction_history: how this stock has typically reacted to past earnings, e.g. "sells off on beats unless guidance clears the whisper", "moves big on guidance", "margin-sensitive". Use the preview's historical notes first. Clearly label anything from your own memory as background knowledge.
-5. storyline_into_print: the narrative going into this release, drawn from the preview: debates, worries, hopes, positioning, recent events.
-6. key_terms: plain definitions of company- or industry-specific metrics and jargon that appear in the materials (e.g. "RPO", "comps", "NII", "book-to-bill").
-7. filings_digest: ONLY from the SEC FILINGS section (write "No filings available." if there is none). State, with dates: (a) what management guided in the previous earnings release, quoting the exact numbers (this is management's own bar for the current quarter); (b) the main trends, risks and drivers from the MD&A; (c) any notable 8-K events since then (acquisitions, executive changes, guidance updates, financing). Flag anything that differs from what the preview says.
-8. reading_guide: which of the call facts deserve the most attention given all of the above, and what to compare each one against. Point to things; do not judge them.
-
-## Hard rules
-- NO NUMBERS FOR SCORING. Never give a score, percentile, rating, direction call or price target.
-- THE MATERIALS WIN. The call facts and the preview are the source of truth, then the SEC filings, then your memory. If sources conflict, say so and defer in that order.
-- NO INVENTED FIGURES. Any number not taken from the materials or the SEC filings must be marked "(approx., background knowledge, may be outdated)". If you are not sure of a fact, leave it out.
-- NOTHING FROM AFTER THE RELEASE. Use only the materials and general knowledge from before the release. Never describe how the stock or market reacted to THIS release.
-- Be specific and concrete. Aim for roughly 500 to 900 words in total. Detail beats length.
-
-## Output
-Return ONLY this JSON, with no other text. Each value is one or more paragraphs of plain text:
-{
-  "company": "",
-  "industry": "",
-  "what_moves_the_stock": "",
-  "reaction_history": "",
-  "storyline_into_print": "",
-  "key_terms": "",
-  "filings_digest": "",
-  "reading_guide": ""
-}
-"""
-
 ANALYST = r"""
+RULE ZERO: Every fact you use must come from the materials given to you in this message. No hallucination, no fabrication, no outside knowledge. If something is not in the materials, it does not exist for this task.
+
 # ROLE: ANALYST
 
 You are a senior equity analyst on an earnings desk. You are the FIRST scoring agent. You score the release from scratch on all 17 dimensions of the UNIVERSAL SCORING RUBRIC (v02), and you show your evidence so the next agents can check every score.
 
 ## Procedure
-0. READ THE BACKGROUND. Use the Context agent's background to understand which drivers matter most for this company and industry. It guides your reading; it is never evidence for a score.
-1. LIST THE BARS. From the preview: Street consensus, whisper / buy-side expectations, bull and bear lines, the ranked metrics to watch. From the BACKGROUND's filings digest: the company's own prior guidance. From the call facts: the company's own prior ranges and year-over-year / sequential comparisons. Label which bar you use for each comparison; never invent a Street number.
+1. LIST THE BARS. From the preview: Street consensus, whisper / buy-side expectations, bull and bear lines, the ranked metrics to watch. From the call facts and the preview: the company's own prior guidance and ranges, and year-over-year / sequential comparisons. Label which bar you use for each comparison; never invent a Street number.
 2. SCORE EVERY DIMENSION from -10 to +10 with the Criteria table. Score guidance_revision with AMENDMENT v02.1 (new guidance vs the highest investor bar). Interpolate between the -10/-5/0/+5/+10 anchors; fractions are fine; use the whole range when the evidence is strong. Zero means balanced evidence, truly absent evidence, or a comparison allocated to another dimension under the Boundaries.
 3. EVIDENCE: for every non-zero score, one short line: "fact (F# or preview section) vs bar -> why this score". Leave evidence empty for zeros.
 4. BOUNDARY CHECK: each economic comparison earns credit once (see Boundaries). The EPS beat itself earns nothing anywhere. A tax- or share-count-driven EPS guide change is not an operating raise.
@@ -651,7 +604,7 @@ You are a senior equity analyst on an earnings desk. You are the FIRST scoring a
 ## Rules
 - Follow the rubric exactly. No gut-feel adjustments outside the dimension scores.
 - Do not leave a dimension at 0 out of caution when the facts support a score.
-- Use only the provided materials. Nothing from after the release.
+- MATERIALS ONLY: every score must rest on the call facts, the preview or the option statistics. Never use your own knowledge of the company, its industry or its history.
 
 ## Output
 Return ONLY this JSON, with no other text:
@@ -684,6 +637,8 @@ Return ONLY this JSON, with no other text:
 """
 
 SCRUTINIZER = r"""
+RULE ZERO: Every fact you use must come from the materials given to you in this message. No hallucination, no fabrication, no outside knowledge. If something is not in the materials, it does not exist for this task.
+
 # ROLE: SCRUTINIZER
 
 You are an independent risk reviewer. You are the SECOND scoring agent. You audit the Analyst's scoresheet dimension by dimension against the materials and the UNIVERSAL SCORING RUBRIC (v02), then produce your own complete 17-dimension scoresheet.
@@ -698,7 +653,7 @@ You have no stake in agreeing or disagreeing. Your only goal is the scoresheet t
 5. NAME THE BIGGEST DISAGREEMENT: the dimension where your score differs most from the Analyst's, and why.
 
 ## Error codes. Every change MUST cite one.
-- FACT: a number is wrong, is not in the materials, or is supported only by the BACKGROUND section.
+- FACT: a number is wrong, or is not in the materials (e.g. it comes from outside knowledge).
 - BAR: scored against the wrong expectation (e.g. consensus used when the preview gives a higher whisper or explicit lines).
 - DOUBLE: one comparison was scored in two dimensions (a Boundaries violation).
 - MISSED: a material fact was left unscored.
@@ -709,7 +664,7 @@ You have no stake in agreeing or disagreeing. Your only goal is the scoresheet t
 - Agreeing is allowed. Never change a score just to differ. Never keep a score just to agree.
 - A JUDGMENT change may move a dimension by at most 3 points. Larger changes require FACT, BAR, DOUBLE, MISSED or SHAVE. (Enforced in code: a bigger JUDGMENT change is cut back to 3 points.)
 - Apply the rubric yourself. Do not average toward the Analyst's sheet.
-- Use only the provided materials. Nothing from after the release.
+- MATERIALS ONLY: every score must rest on the call facts, the preview or the option statistics. Remove any evidence that comes from outside knowledge (error code FACT).
 
 ## Output
 Return ONLY this JSON, with no other text:
@@ -745,6 +700,8 @@ List in `audit` ONLY the dimensions whose score you changed (use the dimension k
 """
 
 PORTFOLIO_MANAGER = r"""
+RULE ZERO: Every fact you use must come from the materials given to you in this message. No hallucination, no fabrication, no outside knowledge. If something is not in the materials, it does not exist for this task.
+
 # ROLE: PORTFOLIO WEIGHING AGENT
 
 You are the portfolio manager. You are the THIRD and FINAL agent. You are called when the Analyst and the Scrutinizer disagree. You settle every disputed dimension using the UNIVERSAL SCORING RUBRIC (v02) and the materials, and produce the settled 17-dimension sheet that becomes the submitted score.
@@ -771,10 +728,9 @@ You will see a QUANT VIEW block computed from the options market: the expected s
 - Your sheet is the UNSIZED view. The Quant step sizes it automatically after you.
 
 ## Rules
-- The BACKGROUND section may help you weigh which disputed dimension matters more for this company. It is never evidence for a score.
 - Do not introduce new facts the agents did not cite, except to verify a FACT or MISSED claim against the materials.
 - Do not default to 0 out of caution. Only the ordering of scores across companies is judged.
-- Use only the provided materials. Nothing from after the release.
+- MATERIALS ONLY: rule only on the call facts, the preview and the option statistics. Never use your own knowledge of the company, its industry or its history.
 
 ## Output
 Return ONLY this JSON, with no other text:
@@ -1004,239 +960,6 @@ def close_call_gap() -> float:
 
 
 # ----------------------------------------------------------------------
-# SEC EDGAR filings (free, public). Everything here is best-effort: any
-# problem returns "" and the pipeline carries on without filings.
-#
-# KNOWLEDGE-CUTOFF SAFETY: a filing is used only if the SEC accepted it at
-# least 24 hours before the event time (and before the official knowledge
-# cutoff when the event carries one). The current quarter's results 8-K is
-# filed on release day, so it can never get in.
-# ----------------------------------------------------------------------
-
-SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
-SEC_SUBMISSIONS_URL = "https://data.sec.gov/submissions/CIK{cik:010d}.json"
-SEC_ARCHIVE_URL = "https://www.sec.gov/Archives/edgar/data/{cik}/{acc_nodash}/"
-SEC_CALL_TIMEOUT = 8.0
-SEC_MAX_BYTES = 15_000_000
-RELEASE_EXCERPT_CHARS = 9000
-MDNA_EXCERPT_CHARS = 9000
-OTHER_8K_LOOKBACK_DAYS = 120
-
-ITEM_NAMES = {
-    "1.01": "Entered a material agreement", "1.02": "Ended a material agreement",
-    "1.03": "Bankruptcy or receivership", "2.01": "Completed an acquisition or sale of assets",
-    "2.02": "Results of operations (earnings release)", "2.03": "New debt or financial obligation",
-    "2.05": "Restructuring / exit costs", "2.06": "Material impairment",
-    "3.01": "Delisting notice", "3.02": "Unregistered sale of shares",
-    "4.01": "Auditor change", "4.02": "Prior financials no longer reliable (restatement)",
-    "5.02": "Director or officer change", "5.03": "Bylaw or fiscal-year change",
-    "5.07": "Shareholder vote results", "7.01": "Regulation FD disclosure",
-    "8.01": "Other events", "9.01": "Financial statements and exhibits",
-}
-
-_ticker_to_cik: dict[str, int] | None = None
-
-
-def _sec_headers() -> dict:
-    agent = os.environ.get("SEC_USER_AGENT", "").strip() or "VotCommand research bot contact@votcommand.example"
-    return {"User-Agent": agent, "Accept-Encoding": "gzip, deflate"}
-
-
-def _sec_get(url: str, timeout: float) -> httpx.Response:
-    """One GET to the SEC. Separate function so tests can replace it."""
-    resp = httpx.get(url, headers=_sec_headers(), timeout=timeout, follow_redirects=True)
-    resp.raise_for_status()
-    if len(resp.content) > SEC_MAX_BYTES:
-        raise ValueError(f"SEC document too large: {len(resp.content)} bytes")
-    return resp
-
-
-def _parse_time(value: object) -> datetime | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-
-
-def filings_cutoff(event_datetime: str | None, knowledge_cutoff: str | None) -> datetime:
-    """Latest acceptance time a filing may have: 24h before the event, and before
-    the knowledge cutoff if known. With no dates at all: 24h before now."""
-    event = _parse_time(event_datetime) or datetime.now(timezone.utc)
-    cutoff = event - timedelta(hours=24)
-    official = _parse_time(knowledge_cutoff)
-    if official is not None and official < cutoff:
-        cutoff = official
-    return cutoff
-
-
-def html_to_text(raw: str) -> str:
-    """Rough HTML -> readable text, dropping scripts, styles and hidden iXBRL data."""
-    raw = re.sub(r"(?is)<(script|style|ix:header)[^>]*>.*?</\1>", " ", raw)
-    raw = re.sub(r"(?i)<br\s*/?>|</(p|div|tr|li|h[1-6]|table)>", "\n", raw)
-    raw = re.sub(r"(?s)<[^>]+>", " ", raw)
-    text = html.unescape(raw).replace("\xa0", " ")
-    text = re.sub(r"[ \t\r\f\v]+", " ", text)
-    text = re.sub(r"\n\s*\n+", "\n\n", text)
-    return text.strip()
-
-
-def _cik_for(ticker: str, deadline: float) -> int | None:
-    global _ticker_to_cik
-    if _ticker_to_cik is None:
-        data = _sec_get(SEC_TICKERS_URL, _call_timeout(deadline)).json()
-        rows = data.values() if isinstance(data, dict) else data
-        _ticker_to_cik = {
-            str(r.get("ticker", "")).upper(): int(r["cik_str"])
-            for r in rows if isinstance(r, dict) and "cik_str" in r
-        }
-    t = ticker.upper()
-    return _ticker_to_cik.get(t) or _ticker_to_cik.get(t.replace(".", "-"))
-
-
-def _call_timeout(deadline: float) -> float:
-    left = deadline - time.monotonic()
-    if left < 1.5:
-        raise TimeoutError("SEC time budget used up")
-    return min(SEC_CALL_TIMEOUT, left)
-
-
-def eligible_filings(submissions: dict, cutoff: datetime) -> list[dict]:
-    """Recent filings accepted before `cutoff`, newest first."""
-    recent = ((submissions or {}).get("filings") or {}).get("recent") or {}
-    forms = recent.get("form") or []
-    out = []
-    for i, form in enumerate(forms):
-        def col(name: str) -> str:
-            values = recent.get(name) or []
-            return values[i] if i < len(values) and values[i] is not None else ""
-        accepted = _parse_time(col("acceptanceDateTime"))
-        if accepted is None:
-            filed = _parse_time(col("filingDate"))
-            accepted = filed + timedelta(hours=23, minutes=59) if filed else None
-        if accepted is None or accepted >= cutoff:
-            continue
-        out.append({
-            "form": str(form), "accession": col("accessionNumber"),
-            "filing_date": col("filingDate"), "report_date": col("reportDate"),
-            "primary_document": col("primaryDocument"), "items": str(col("items")),
-            "accepted": accepted,
-        })
-    out.sort(key=lambda f: f["accepted"], reverse=True)
-    return out
-
-
-def _filing_url(cik: int, accession: str, name: str = "") -> str:
-    return SEC_ARCHIVE_URL.format(cik=cik, acc_nodash=accession.replace("-", "")) + name
-
-
-def find_exhibit_991(index_html: str) -> str | None:
-    """From a filing's -index.htm page, the file name of EX-99.1 (else any EX-99)."""
-    best = None
-    for row in re.findall(r"(?is)<tr[^>]*>(.*?)</tr>", index_html):
-        type_match = re.search(r"(?i)>\s*(EX-99[.\d]*)\s*<", row)
-        href_match = re.search(r'(?i)href="([^"]+)"', row)
-        if not type_match or not href_match:
-            continue
-        name = href_match.group(1).rsplit("/", 1)[-1]
-        if type_match.group(1).upper() == "EX-99.1":
-            return name
-        best = best or name
-    return best
-
-
-def release_excerpt(text: str, limit: int = RELEASE_EXCERPT_CHARS) -> str:
-    """The opening of a press release plus its outlook / guidance section."""
-    half = limit // 2
-    match = re.search(r"(?i)\b(outlook|guidance)\b", text[half:])
-    if not match:
-        return text[:limit]
-    at = half + match.start()
-    return text[:half] + "\n[...]\n" + text[max(half, at - 200): at - 200 + half]
-
-
-def mdna_excerpt(text: str, annual: bool, limit: int = MDNA_EXCERPT_CHARS) -> str:
-    """Management's Discussion and Analysis, skipping the table of contents."""
-    item = r"item\s*7" if annual else r"item\s*2"
-    stop = r"item\s*7a" if annual else r"item\s*3"
-    pattern = re.compile(item + r"\.?\s*[\-–—:.]?\s*management.{0,3}s\s+discussion\s+and\s+analysis", re.I)
-    for match in pattern.finditer(text):
-        after = text[match.start(): match.start() + 400]
-        if re.search(stop, after[60:], re.I):
-            continue                                  # a table-of-contents line
-        section = text[match.start(): match.start() + limit]
-        end = re.search(stop + r"\.?\s*[\-–—:.]?\s*quantitative", section[200:], re.I)
-        return section[: 200 + end.start()] if end else section
-    return ""
-
-
-def sec_dossier(ticker: str, cutoff: datetime, seconds: float) -> str:
-    """Build the SEC FILINGS text for the Context agent. Never raises; "" on failure."""
-    if seconds < 3:
-        return ""
-    deadline = time.monotonic() + seconds
-    parts: list[str] = []
-    try:
-        cik = _cik_for(ticker, deadline)
-        if cik is None:
-            print(f"[SEC] {ticker}: no CIK found (foreign filer or unknown ticker)")
-            return ""
-        subs = _sec_get(SEC_SUBMISSIONS_URL.format(cik=cik), _call_timeout(deadline)).json()
-        filings = eligible_filings(subs, cutoff)
-        eightks = [f for f in filings if f["form"] in ("8-K", "8-K/A")]
-        earnings = next((f for f in eightks if "2.02" in f["items"]), None)
-        periodic = next((f for f in filings if f["form"] in ("10-Q", "10-K")), None)
-
-        if earnings:
-            try:
-                index_html = _sec_get(
-                    _filing_url(cik, earnings["accession"], earnings["accession"] + "-index.htm"),
-                    _call_timeout(deadline)).text
-                name = find_exhibit_991(index_html) or earnings["primary_document"]
-                text = html_to_text(_sec_get(_filing_url(cik, earnings["accession"], name),
-                                             _call_timeout(deadline)).text)
-                if text:
-                    parts.append(f"PREVIOUS EARNINGS RELEASE (8-K filed {earnings['filing_date']}, "
-                                 f"exhibit {name}), excerpt:\n{release_excerpt(text)}")
-            except Exception as exc:
-                print(f"[SEC] {ticker}: earnings release skipped: {exc!r}")
-
-        if periodic and periodic["primary_document"]:
-            try:
-                text = html_to_text(_sec_get(
-                    _filing_url(cik, periodic["accession"], periodic["primary_document"]),
-                    _call_timeout(deadline)).text)
-                mdna = mdna_excerpt(text, annual=periodic["form"] == "10-K")
-                if mdna:
-                    parts.append(f"LATEST {periodic['form']} (filed {periodic['filing_date']}, period "
-                                 f"{periodic['report_date'] or 'n/a'}), MD&A excerpt:\n{mdna}")
-            except Exception as exc:
-                print(f"[SEC] {ticker}: {periodic['form']} skipped: {exc!r}")
-
-        since = (earnings["accepted"] if earnings
-                 else cutoff - timedelta(days=OTHER_8K_LOOKBACK_DAYS))
-        others = [f for f in eightks if f["accepted"] > since and f is not earnings]
-        lines = []
-        for f in others[:12]:
-            codes = [c.strip() for c in f["items"].split(",") if c.strip() and c.strip() != "9.01"]
-            names = "; ".join(f"{c} {ITEM_NAMES.get(c, '')}".strip() for c in codes) or "no items listed"
-            lines.append(f"- {f['filing_date']}: {f['form']} - {names}")
-        if lines:
-            parts.append("OTHER 8-K FILINGS SINCE THE PREVIOUS EARNINGS RELEASE:\n" + "\n".join(lines))
-    except Exception as exc:
-        print(f"[SEC] {ticker}: filings skipped: {exc!r}")
-    if not parts:
-        return ""
-    dossier = ("SEC FILINGS (from EDGAR; every filing here was accepted before "
-               f"{cutoff.strftime('%Y-%m-%d %H:%M UTC')}, i.e. before this release):\n\n"
-               + "\n\n".join(parts))
-    print(f"[SEC] {ticker}: {len(dossier)} chars of filings")
-    return dossier
-
-
-# ----------------------------------------------------------------------
 # Calling one agent.
 # ----------------------------------------------------------------------
 
@@ -1289,7 +1012,7 @@ def call_agent(role_prompt: str, user_message: str, seconds: float,
     `effort` overrides OPENAI_REASONING_EFFORT for this one call."""
     kwargs = {}
     if effort is None:
-        effort = os.environ.get("OPENAI_REASONING_EFFORT", "")
+        effort = os.environ.get("OPENAI_REASONING_EFFORT", SCORING_EFFORT_DEFAULT)
     effort = effort.strip()
     if effort:
         kwargs["reasoning_effort"] = effort
@@ -1323,53 +1046,8 @@ def _log(tag: str, payload: object) -> None:
         print(f"[{tag}] (unprintable)")
 
 
-BACKGROUND_SECTIONS = [
-    ("company", "Company"),
-    ("industry", "Industry"),
-    ("what_moves_the_stock", "What moves the stock"),
-    ("reaction_history", "Reaction history"),
-    ("storyline_into_print", "Storyline into the print"),
-    ("key_terms", "Key terms"),
-    ("filings_digest", "From SEC filings"),
-    ("reading_guide", "Reading guide"),
-]
-BACKGROUND_MAX_CHARS = 8000
-
-
-def get_background(context: str, ticker: str, seconds: float, filings: str = "") -> str:
-    """Run the Context agent and turn its JSON into labelled paragraphs.
-    Returns "" on any failure, so the pipeline simply carries on without it."""
-    if seconds < MIN_CALL_SECONDS:
-        return ""
-    try:
-        data = call_agent(
-            CONTEXT,
-            context
-            + ("\n\n" + filings if filings else "\n\nSEC FILINGS: none available.")
-            + "\n\nWrite the background. Return JSON only.",
-            seconds,
-            with_rubric=False,
-            # The Context agent only writes background, so it can think less hard
-            # and finish faster. Unset = same effort as the other agents.
-            effort=os.environ.get("CONTEXT_REASONING_EFFORT") or None,
-        )
-    except Exception as exc:
-        print(f"[WARN] {ticker} context agent failed: {exc!r} -> continuing without it")
-        return ""
-    parts = []
-    for key, label in BACKGROUND_SECTIONS:
-        text = data.get(key)
-        if isinstance(text, list):
-            text = "\n".join(str(t) for t in text)
-        if isinstance(text, str) and text.strip():
-            parts.append(f"{label}:\n{text.strip()}")
-    background = "\n\n".join(parts)[:BACKGROUND_MAX_CHARS]
-    _log("CONTEXT", {"ticker": ticker, "background": background})
-    return background
-
-
 # ----------------------------------------------------------------------
-# The pipeline: Context -> Analyst -> Scrutinizer -> Portfolio Manager.
+# The pipeline: Analyst -> Scrutinizer -> Portfolio Manager.
 # ----------------------------------------------------------------------
 
 def run_agents(*, bundle: object, ticker: str, event_type: str,
@@ -1398,7 +1076,7 @@ def run_agents(*, bundle: object, ticker: str, event_type: str,
 
 def _decide(*, bundle: object, ticker: str, event_type: str,
             event_datetime: str | None, knowledge_cutoff: str | None, t: dict) -> float:
-    """Context -> Analyst -> Scrutinizer -> PM. Returns the UNSIZED score."""
+    """Analyst -> Scrutinizer -> PM, on the event materials only. Returns the UNSIZED score."""
     global _warned_no_key
     if not os.environ.get("OPENAI_API_KEY"):
         if not _warned_no_key:
@@ -1432,28 +1110,20 @@ def _decide(*, bundle: object, ticker: str, event_type: str,
         f"MATERIALS:\n{materials}"
     )
 
-    # 0. CONTEXT (background only, never a number; skipped on failure)
-    t["filings_chars"] = t["background_chars"] = 0
-    if os.environ.get("USE_CONTEXT_AGENT", "1") != "0":
-        filings = ""
-        if os.environ.get("USE_SEC_FILINGS", "1") != "0":
-            filings = sec_dossier(ticker, filings_cutoff(event_datetime, knowledge_cutoff),
-                                  min(SEC_MAX_SECONDS, max(0.0, seconds_left() - 200.0)))
-            mark("sec_filings")
-        background = get_background(context, ticker,
-                                    min(CONTEXT_MAX_SECONDS, seconds_left()), filings)
-        mark("context")
-        t["filings_chars"], t["background_chars"] = len(filings), len(background)
-        if background:
-            context += (
-                "\n\nBACKGROUND (from the Context agent: for interpretation only, "
-                "NOT evidence; the materials win any conflict):\n" + background
-            )
-
     # 1. ANALYST
+    analyst_msg = context + "\n\nScore this release. Return JSON only."
     try:
-        analyst = call_agent(ANALYST, context + "\n\nScore this release. Return JSON only.",
-                             seconds_left())
+        try:
+            analyst = call_agent(ANALYST, analyst_msg, seconds_left())
+        except Exception as exc:
+            # One retry at the model's default effort (faster), so a slow or
+            # rejected high-effort call does not turn the event into a 0.50.
+            t["errors"].append(f"analyst: {exc!r}")
+            if seconds_left() < MIN_CALL_SECONDS + 15:
+                raise
+            print(f"[RETRY] {ticker} analyst failed ({exc!r}); retrying at default effort")
+            analyst = call_agent(ANALYST, analyst_msg, seconds_left(), effort="")
+            t["analyst_retried"] = True
     except Exception as exc:
         print(f"[ERROR] {ticker} analyst failed: {exc!r} -> 0.5")
         t["errors"].append(f"analyst: {exc!r}")
