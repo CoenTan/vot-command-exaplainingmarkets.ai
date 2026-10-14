@@ -56,10 +56,11 @@ def fake(monkeypatch):
     monkeypatch.delenv("ALWAYS_CALL_PM", raising=False)
     monkeypatch.delenv("CLOSE_CALL_GAP", raising=False)
     monkeypatch.delenv("OPENAI_REASONING_EFFORT", raising=False)
-    # Pipeline tests use simple arithmetic: every weight 1, so
-    # score = 0.5 + (sum of dimension scores) / 20, and no Quant sizing.
-    # The real v02 weights and sizing are tested on their own below.
-    monkeypatch.setenv("COMPONENT_WEIGHTS", ",".join(f"{k}=1" for k in P.DIMENSIONS))
+    # Pipeline tests use simple arithmetic: every weight 0.05, no intercept, so
+    # score = 0.5 + 0.05 x (sum of dimension scores), and no Quant sizing.
+    # The real v04 fitted weights are tested on their own below.
+    monkeypatch.setenv("COMPONENT_WEIGHTS", ",".join(f"{k}=0.05" for k in P.DIMENSIONS))
+    monkeypatch.setenv("SCORE_INTERCEPT", "0")
     monkeypatch.setenv("QUANT_POWER", "0")
     monkeypatch.setenv("QUANT_REF_MOVE", "0.06")
     monkeypatch.setenv("QUANT_PIVOT", "0.5")
@@ -77,10 +78,13 @@ def run(bundle=BUNDLE):
 
 # ---------- arithmetic ----------
 
-def test_v02_has_17_dimensions_and_weights_sum_to_one():
-    assert len(P.DIMENSIONS) == 17
-    assert abs(sum(P.DEFAULT_WEIGHTS.values()) - 1.0) < 1e-9
-    assert P.DEFAULT_WEIGHTS[G] == 0.31 and P.DEFAULT_WEIGHTS[F] == 0.2
+def test_v04_has_17_fitted_weights_and_an_intercept():
+    assert len(P.DIMENSIONS) == 17 and set(P.DEFAULT_WEIGHTS) == set(P.HAND_WEIGHTS)
+    assert abs(P.DEFAULT_WEIGHTS[G] - 0.0140085) < 1e-6
+    assert abs(P.DEFAULT_WEIGHTS["expectations_gap"] - 0.0118308) < 1e-6
+    assert P.DEFAULT_WEIGHTS["revenue_growth"] < 0 and P.DEFAULT_WEIGHTS["beat_quality"] < 0
+    assert abs(P.FITTED_INTERCEPT - (-0.0500740)) < 1e-6
+    assert abs(sum(P.HAND_WEIGHTS.values()) - 1.0) < 1e-9
 
 
 def test_every_dimension_is_in_every_scoring_prompt():
@@ -88,8 +92,8 @@ def test_every_dimension_is_in_every_scoring_prompt():
         for d in P.DIMENSIONS:
             assert f'"{d}"' in prompt
     assert "## Boundaries" in P.RUBRIC and "## Worked TRAIN examples" in P.RUBRIC
-    # v02.1: guidance is scored against the highest investor bar
-    assert "AMENDMENT v02.1" in P.RUBRIC and "HIGHEST investor bar" in P.RUBRIC
+    # v04 uses the plain v02 text: no v02.1 amendment
+    assert "AMENDMENT v02.1" not in P.RUBRIC and "# Rubric v02:" in P.RUBRIC
 
 
 def test_scores_are_read_and_clamped():
@@ -101,34 +105,43 @@ def test_scores_are_read_and_clamped():
     (0, 0.50), (4, 0.70), (-4, 0.30), (30, 0.999), (-30, 0.001), (1.3, 0.565),
 ])
 def test_score_from_points(total, expected, monkeypatch):
-    monkeypatch.setenv("COMPONENT_WEIGHTS", ",".join(f"{k}=1" for k in P.DIMENSIONS))
+    monkeypatch.setenv("COMPONENT_WEIGHTS", ",".join(f"{k}=0.05" for k in P.DIMENSIONS))
+    monkeypatch.setenv("SCORE_INTERCEPT", "0")
     assert P.score_from_points({G: total})["score"] == expected
 
 
 def test_component_weights_from_env(monkeypatch):
-    monkeypatch.setenv("COMPONENT_WEIGHTS", f"{G}=0.5, bogus=9, new_risks=abc, gross_margin=99")
+    monkeypatch.setenv("COMPONENT_WEIGHTS", f"{G}=0.5, bogus=9, new_risks=abc, gross_margin=99, revenue_growth=-0.01")
     w = P.component_weights()
-    assert w[G] == 0.5
+    assert w[G] == 0.5 and w["revenue_growth"] == -0.01     # signed weights allowed
     assert w["new_risks"] == P.DEFAULT_WEIGHTS["new_risks"]
     assert w["gross_margin"] == P.DEFAULT_WEIGHTS["gross_margin"]
 
 
-def test_v02_default_weights(monkeypatch):
+def test_v04_default_scoring(monkeypatch):
     monkeypatch.delenv("COMPONENT_WEIGHTS", raising=False)
+    monkeypatch.delenv("SCORE_INTERCEPT", raising=False)
     assert P.component_weights() == P.DEFAULT_WEIGHTS
-    # guidance_revision +10 alone: 0.31 x 10 = 3.1 -> 0.5 + 3.1/20 = 0.655
-    assert P.score_from_points({G: 10}) == {"weighted_total": 3.1, "total_s": 3.1, "score": 0.655}
-    # +5 guidance, +5 forward outlook: 1.55 + 1.0 = 2.55 -> 0.6275
-    assert P.score_from_points({G: 5, F: 5})["score"] == 0.6275
+    # all zeros -> 0.5 + intercept
+    assert P.score_from_points({})["score"] == round(0.5 + P.FITTED_INTERCEPT, 4)
+    # guidance_revision +10: 0.5 - 0.0501 + 0.1401 = 0.59
+    assert P.score_from_points({G: 10})["score"] == 0.59
+    # a revenue beat alone pulls the score DOWN (negative fitted weight)
+    assert P.score_from_points({RV: 10})["score"] < P.score_from_points({})["score"]
+    # the old v02 total is still logged for diagnostics
+    assert P.score_from_points({G: 10})["hand_total"] == 3.1
 
 
 def test_quant_defaults(monkeypatch):
     for k in ("QUANT_POWER", "QUANT_REF_MOVE", "QUANT_PIVOT"):
         monkeypatch.delenv(k, raising=False)
-    assert P.apply_quant(0.70, 0.08) == 0.70       # median move: unchanged
+    # v04: sizing is OFF by default
+    assert P.apply_quant(0.70, 0.08) == 0.70
+    assert P.apply_quant(0.70, 0.32) == 0.70
+    assert P.apply_quant(0.30, 0.01) == 0.30
+    # switched back on, it still works
+    monkeypatch.setenv("QUANT_POWER", "0.25")
     assert P.apply_quant(0.70, 0.32) == 0.7828     # 4x move -> distance x 4^0.25 = 1.414
-    assert P.apply_quant(0.50, 0.32) == 0.50       # the pivot never moves
-    assert P.apply_quant(0.70, None) == 0.70
 
 
 @pytest.mark.parametrize("score, move, expected", [
@@ -202,7 +215,7 @@ def test_models_maths_is_overwritten_before_the_next_agent_sees_it(fake):
     client = fake(sheet(**{G: 2}), sheet(**{G: 2}))
     run()
     sent_to_scrutinizer = client.sent[1]["messages"][1]["content"]
-    assert '"score": 0.6' in sent_to_scrutinizer and '"weighted_total": 2.0' in sent_to_scrutinizer
+    assert '"score": 0.6' in sent_to_scrutinizer and '"weighted_total": 0.1' in sent_to_scrutinizer
 
 
 def test_json_inside_code_fences_is_accepted(fake):
@@ -215,7 +228,7 @@ def test_rubric_is_sent_with_every_role(fake):
     run()
     for call in client.sent:
         system = call["messages"][0]["content"]
-        assert "UNIVERSAL SCORING RUBRIC (v02.1)" in system
+        assert "UNIVERSAL SCORING RUBRIC (v04)" in system
         assert call["response_format"] == {"type": "json_object"}
 
 

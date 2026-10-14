@@ -1,7 +1,7 @@
 """VOT COMMAND, iteration 4: Analyst -> Scrutinizer -> Portfolio Manager, MATERIALS ONLY,
-scored with the v02.1 rubric: the v2 bot's v02 (17 dimensions, -10..+10) plus one
-amendment that scores guidance against investor expectations (whisper > consensus >
-the company's prior guidance).
+scored with rubric v04 from the v2 bot: the v02 rubric text (17 dimensions, -10..+10)
+with weights fitted on 853 Q3 2026 events (out-of-sample dR2 0.116-0.158 vs 0.090 for
+the hand weights). Score = clamp(0.5 + intercept + sum(w x score), 0.001, 0.999).
 
 THIS IS THE ONLY FILE YOU EDIT. Everything else in the repo is plumbing.
 
@@ -13,11 +13,10 @@ How one event flows:
   3. SCRUTINIZER audits the Analyst and scores it again.
   4. PORTFOLIO MANAGER settles it (skipped on close calls: Python averages
      the two scores and saves a call).
-  5. Python re-does every agent's arithmetic: weighted_total = sum(weight x score),
-     percentile = 0.5 + weighted_total / 20, kept within 0.001..0.999.
-  6. QUANT (Python, no AI) sizes the final score with the options market's
-     expected move: pivot + (score - pivot) * (move / reference_move) ** power.
-     Big expected move -> further from the middle. It never picks a direction.
+  5. Python re-does every agent's arithmetic with the v04 fitted weights:
+     score = 0.5 + intercept + sum(weight x dimension score), kept within 0.001..0.999.
+  6. QUANT sizing is OFF by default (QUANT_POWER=0): the v2 bot's tests found
+     magnitude transforms add nothing. Set QUANT_POWER > 0 to switch it back on.
      Scores are continuous (no 0.05 grid), so fewer ties.
 
 Safety nets (a missed event counts against you, so something is ALWAYS sent):
@@ -30,13 +29,14 @@ Optional settings in .env:
   OPENAI_MODEL               model for every agent (default: the starter's default)
   OPENAI_REASONING_EFFORT    effort for every agent (default: high); e.g. medium / high / xhigh
   ALWAYS_CALL_PM             set to 1 to call the PM even on close calls
-  COMPONENT_WEIGHTS          e.g. "guidance_revision=0.4" (others keep the v02 weights)
+  COMPONENT_WEIGHTS          override fitted weights, e.g. "guidance_revision=0.02"
+  SCORE_INTERCEPT            override the fitted intercept (default -0.0501)
   CLOSE_CALL_GAP             max Analyst/Scrutinizer gap that skips the PM (default 0.05)
-  QUANT_POWER                sizing strength (default 0.25; 0 = sizing off)
+  QUANT_POWER                sizing strength (default 0 = off; e.g. 0.25 to switch on)
   QUANT_REF_MOVE             a "normal" expected move (default 0.08 = 8%, the 2026Q3 median)
   QUANT_PIVOT                centre for sizing (default 0.50)
 
-The 17 dimension weights are the v02 rubric's (rubric/weights.json in the v2 bot).
+The 17 weights and the intercept are the v2 bot's rubric/versions/v04/fitted_weights.json.
   BOT_QUIET                  set to 1 to hide the agents' full JSON in logs
 
 To change how agents think, edit the prompt blocks below
@@ -223,36 +223,15 @@ def format_materials(bundle: object) -> str:
 RUBRIC = r"""
 RULE ZERO: Every fact you use must come from the materials given to you in this message. No hallucination, no fabrication, no outside knowledge. If something is not in the materials, it does not exist for this task.
 
-# UNIVERSAL SCORING RUBRIC (v02.1)
+# UNIVERSAL SCORING RUBRIC (v04)
 
 How this rubric maps to this system (read first):
 - Every scoring agent fills a `components` sheet with ALL 17 dimensions below, each scored from -10 to +10 (fractions allowed).
 - MATERIALS ONLY. Use nothing except the event's own materials: the call facts, the earnings preview and the option statistics. Do not use your memory or general knowledge of the company, its industry, its past results, its past guidance, its stock history or any news. If a bar or comparison is not in the materials, treat it as unavailable.
 - "Dossier", "comparator" and "point-in-time context" mean only what the materials contain: the earnings preview and the option statistics. The call facts are the F1-F10 of the worked examples.
-- Python is authoritative for the arithmetic. It recomputes weighted_total and the percentile from your dimension scores and overwrites your own numbers, so get the SCORES right.
+- Python is authoritative for the arithmetic. It turns your 17 dimension scores into the final number with weights fitted on past outcomes (v04), and overwrites your own numbers, so get the SCORES right. Your own weighted_total and score fields are diagnostic only.
 - The objective is the RANK of this stock's one-day, market-adjusted reaction among all releases this quarter, beyond what the EPS-surprise percentile already explains. Only the ordering across companies is judged.
 - Option skew is never evidence of direction.
-
-## AMENDMENT v02.1: how guidance_revision is scored (overrides the v02 text below wherever they differ)
-Markets react to new guidance relative to what investors EXPECTED, not only relative to the company's own old guidance. So guidance_revision scores the NEW forward guidance (next-quarter or full-year revenue / operating guidance) against the HIGHEST investor bar available, in this order:
-  1. the preview's bull line or buy-side / whisper number
-  2. Street consensus for that guided metric
-  3. the company's own prior guidance (the original v02 rule)
-Name the bar you used in the evidence line.
-
-Which guidance to score: the guided metric the preview ranks as most important. If the preview does not rank them, next-quarter guidance comes first. Other horizons (e.g. a full-year raise) may move the score by at most 3 points either way; a full-year raise cannot turn a next-quarter guide that misses the bar into a positive score.
-
-Scale against an investor bar (gap = guided midpoint vs the bar, in %):
-  +8 to +10  clears the whisper / bull line by 3% or more
-  +4 to +7   clears the whisper / bull line by less than 3%
-  -3 to +3   between consensus and the whisper / bull line (meets the Street, not what investors hoped for); closer to the whisper -> closer to 0
-  -4 to -7   below consensus by less than 3%
-  -8 to -10  below consensus by 3% or more, or guidance withdrawn
-  If only consensus is available: +5 to +8 above it by 3% or more; +2 to +4 above it by less than 3%; mirror these for shortfalls.
-  If no investor bar exists: use the original v02 criteria (revision vs the company's prior guidance).
-A tax- or share-count-driven EPS guidance change is still not an operating raise.
-
-expectations_gap now covers CURRENT-period reported results (revenue, KPIs, margins) against Street / preview bars only. A guidance-versus-expectations comparison is scored once, in guidance_revision, never in expectations_gap.
 
 ---
 
@@ -290,9 +269,9 @@ Use each economic comparison once. Distinct periods, metrics or independent marg
 
 ## Boundaries
 
-- guidance_revision: Not to be confused with forward_operating_outlook: score new guidance against the highest investor bar here (see AMENDMENT v02.1); do not score the level of the same projection twice.
+- guidance_revision: Not to be confused with forward_operating_outlook: score the revision to an old bar here, not the level of the same projection twice.
 - forward_operating_outlook: Not to be confused with guidance_revision: use a different metric/period, or forward profitability ratio; a shared revenue denominator is allowed, duplicate numerator/comparison is not.
-- expectations_gap: Not to be confused with guidance_revision/revenue_growth: reserve an explicit Street or preview comparison of CURRENT-period results here; guidance-versus-expectations belongs in guidance_revision (AMENDMENT v02.1). EPS surprise and option-implied movement alone are not direction.
+- expectations_gap: Not to be confused with guidance_revision/revenue_growth: reserve an explicit Street or preview comparison here; EPS surprise and option-implied movement alone are not direction.
 - revenue_growth: Not to be confused with organic_comparable_growth: use only one for the same current sales series unless an independent explicit sales-bar comparison exists.
 - organic_comparable_growth: Not to be confused with volume_price_mix: allocate aggregate underlying growth here or its decomposition there; do not reward both without distinct evidence.
 - volume_price_mix: Not to be confused with operating_kpi: assign a particular unit/price comparison to only one; a different brand/metric can support the other.
@@ -596,7 +575,7 @@ You are a senior equity analyst on an earnings desk. You are the FIRST scoring a
 
 ## Procedure
 1. LIST THE BARS. From the preview: Street consensus, whisper / buy-side expectations, bull and bear lines, the ranked metrics to watch. From the call facts and the preview: the company's own prior guidance and ranges, and year-over-year / sequential comparisons. Label which bar you use for each comparison; never invent a Street number.
-2. SCORE EVERY DIMENSION from -10 to +10 with the Criteria table. Score guidance_revision with AMENDMENT v02.1 (new guidance vs the highest investor bar). Interpolate between the -10/-5/0/+5/+10 anchors; fractions are fine; use the whole range when the evidence is strong. Zero means balanced evidence, truly absent evidence, or a comparison allocated to another dimension under the Boundaries.
+2. SCORE EVERY DIMENSION from -10 to +10 with the Criteria table. Interpolate between the -10/-5/0/+5/+10 anchors; fractions are fine; use the whole range when the evidence is strong. Zero means balanced evidence, truly absent evidence, or a comparison allocated to another dimension under the Boundaries.
 3. EVIDENCE: for every non-zero score, one short line: "fact (F# or preview section) vs bar -> why this score". Leave evidence empty for zeros.
 4. BOUNDARY CHECK: each economic comparison earns credit once (see Boundaries). The EPS beat itself earns nothing anywhere. A tax- or share-count-driven EPS guide change is not an operating raise.
 5. CASE AGAINST: one sentence giving the strongest fact-based reason your overall picture could be wrong. The Scrutinizer starts there.
@@ -718,9 +697,9 @@ You are the portfolio manager. You are the THIRD and FINAL agent. You are called
    - Check the Scrutinizer's FACT, MISSED and SHAVE claims against the materials yourself. A verified one always wins.
    - Apply the Boundaries to your settled sheet: one comparison earns credit once.
 3. SANITY CHECKS on the settled sheet, in order.
-   a. SCENARIO CHECK: if the preview has bear/base/bull scenarios, decide which one the results match on the HEADLINE numbers (reported revenue and the guidance midpoint against each scenario's ranges; if they point to different scenarios, guidance wins). The weighted total should fit that scenario: bear <= -3 (score <= 0.35), base -2..+2 (0.40-0.60), bull >= +3 (score >= 0.65). If it does not, re-check the settled scores against the materials. Change a dimension only for a fact-based reason, and write that reason in `scenario_override_reason`. Never change the result without changing scores.
+   a. SCENARIO CHECK: if the preview has bear/base/bull scenarios, decide which one the results match on the HEADLINE numbers (reported revenue and the guidance midpoint against each scenario's ranges; if they point to different scenarios, guidance wins). The weighted total (using the rubric table's weights) should fit that scenario: bear <= -3, base -2..+2, bull >= +3. If it does not, re-check the settled scores against the materials. Change a dimension only for a fact-based reason, and write that reason in `scenario_override_reason`. Never change the result without changing scores.
    b. NO LAZY ZEROS: do not set a dimension to 0 out of caution when the evidence supports a score.
-4. Python recomputes the final score from your `settled_components` (weighted_total = sum of weight x score, percentile = 0.5 + weighted_total / 20). The SCORES are what count.
+4. Python recomputes the final score from your `settled_components` with the v04 fitted weights. The SCORES are what count.
 
 ## The QUANT VIEW
 You will see a QUANT VIEW block computed from the options market: the expected size of the move and the skew.
@@ -774,8 +753,31 @@ Return ONLY this JSON, with no other text:
 # ----------------------------------------------------------------------
 
 SCALE = 10.0                       # every dimension is scored from -10 to +10
-# The v02 rubric's weights (they sum to 1, so weighted_total is also -10..+10).
+# v04 (from the v2 bot): weights fitted by ridge regression on 853 payload-only
+# Q3 2026 events, in percentile units. Signed; they need not sum to 1.
+# score = clamp(0.5 + FITTED_INTERCEPT + sum(weight x score), 0.001, 0.999)
 DEFAULT_WEIGHTS = {
+    "guidance_revision": 0.014008509843976339,
+    "forward_operating_outlook": 0.007272416778666788,
+    "expectations_gap": 0.0118307959541204,
+    "revenue_growth": -0.0052346319034462544,
+    "organic_comparable_growth": 0.002182983087968792,
+    "volume_price_mix": 0.00031042384885102126,
+    "gross_margin": 0.0007596615043756978,
+    "operating_leverage": 0.0016288961212956863,
+    "cash_conversion": 0.004486742681352875,
+    "beat_quality": -0.003645020965390088,
+    "operating_kpi": 0.0009457463023490832,
+    "forward_demand": 0.0042844338582846645,
+    "segment_breadth": 0.00014396281570436172,
+    "execution_visibility": -0.0012576193858623707,
+    "balance_sheet_liquidity": -7.473102392730873e-05,
+    "capital_return": 0.0024322625453753344,
+    "new_risks": 0.0022983025677722493,
+}
+FITTED_INTERCEPT = -0.05007395881145196
+# The v02 hand weights, kept only for the diagnostic "hand_total" in logs.
+HAND_WEIGHTS = {
     "guidance_revision": 0.31,
     "forward_operating_outlook": 0.2,
     "expectations_gap": 0.04,
@@ -799,8 +801,8 @@ COMPONENT_LIMITS = {d: SCALE for d in DIMENSIONS}   # kept for older scripts
 LOWEST, HIGHEST = 0.001, 0.999
 CLOSE_CALL_GAP_DEFAULT = 0.05      # Analyst/Scrutinizer gap that still skips the PM
 JUDGMENT_MAX_MOVE = 3.0            # a JUDGMENT change may move a dimension this far
-# QUANT sizing defaults (2026Q3 median move; pivot at the middle of the v02 scale).
-QUANT_POWER_DEFAULT = 0.25
+# QUANT sizing defaults (only used if QUANT_POWER > 0).
+QUANT_POWER_DEFAULT = 0.0        # off: the v2 bot found magnitude scaling adds nothing
 QUANT_REF_MOVE_DEFAULT = 0.08
 QUANT_PIVOT_DEFAULT = 0.50
 
@@ -855,24 +857,32 @@ def points_from_sheet(components: object) -> dict[str, float]:
 
 
 def component_weights() -> dict[str, float]:
-    """Weights per dimension (default: the v02 weights). Override in .env, e.g.
-    COMPONENT_WEIGHTS="guidance_revision=0.4,new_risks=0". Bad entries are ignored."""
+    """Weights per dimension (default: the v04 fitted weights). Override in .env, e.g.
+    COMPONENT_WEIGHTS="guidance_revision=0.02,new_risks=0". Signed values allowed;
+    bad entries are ignored."""
     weights = dict(DEFAULT_WEIGHTS)
     for part in os.environ.get("COMPONENT_WEIGHTS", "").split(","):
         if "=" in part:
             key, _, value = part.partition("=")
             number = _as_number(value)
-            if key.strip() in weights and number is not None and 0 <= number <= 5:
+            if key.strip() in weights and number is not None and abs(number) <= 5:
                 weights[key.strip()] = number
     return weights
 
 
+def score_intercept() -> float:
+    return _env_number("SCORE_INTERCEPT", FITTED_INTERCEPT)
+
+
 def score_from_points(points: dict[str, float]) -> dict:
-    """weighted_total = sum(weight x score); percentile = 0.5 + weighted_total / 20."""
+    """v04: score = clamp(0.5 + intercept + sum(weight x score), 0.001, 0.999).
+    `hand_total` is the old v02 weighted total, for the logs only."""
     weights = component_weights()
     total = sum(weights[k] * points.get(k, 0) for k in DIMENSIONS)
-    return {"weighted_total": round(total, 4), "total_s": round(total, 4),
-            "score": _tidy(0.5 + total / (2 * SCALE))}
+    hand = sum(HAND_WEIGHTS[k] * points.get(k, 0) for k in DIMENSIONS)
+    return {"weighted_total": round(total, 6), "total_s": round(total, 6),
+            "hand_total": round(hand, 4),
+            "score": _tidy(0.5 + score_intercept() + total)}
 
 
 def _env_number(name: str, default: float) -> float:
